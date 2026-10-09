@@ -501,7 +501,7 @@ torch_tpu_py_test(
     ],
     env = TEST_COV_ENV,
     main = "collective_errors_test.py",
-    notap = "Run by error_coverage_test in the torch_tpu.error_coverage Guitar workflow.",
+    notap = "Run as a data dep by error_coverage_test in TAP opt presubmit.",
     tags = if_oss(
         ["exclusive"],
         [],

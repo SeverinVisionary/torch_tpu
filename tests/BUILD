@@ -1766,8 +1766,7 @@ torch_tpu_py_test(
     ],
     env = TEST_COV_ENV,
     main = "errors_test.py",
-    notap = "Run by error_coverage_test in the torch_tpu.error_coverage Guitar workflow.",
-    shard_count = 4,
+    notap = "Run as a data dep by error_coverage_test in TAP opt presubmit.",
     tags = [
         "nosan",  # *san builds are low-value for error tests.
         "requires-tpu-v5lite",
@@ -1797,8 +1796,7 @@ torch_tpu_py_test(
     ],
     env = TEST_COV_ENV,
     main = "tpu_errors_test.py",
-    notap = "Run by error_coverage_test in the torch_tpu.error_coverage Guitar workflow.",
-    shard_count = 4,
+    notap = "Run as a data dep by error_coverage_test in TAP opt presubmit.",
     tags = [
         "nosan",  # *san builds are low-value for error tests.
         "requires-tpu-v5lite",
