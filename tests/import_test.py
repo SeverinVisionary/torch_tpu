@@ -14,12 +14,68 @@
 
 """Tests for TorchTPU module import handling and ordering."""
 
+import collections
+from collections.abc import Mapping, Set
+import importlib
+import importlib.util
 import os
+import pkgutil
+import queue
+import sys
 import traceback
+import types
+from typing import Final
+import warnings
 
 from absl.testing import absltest
 from absl.testing import parameterized
 from torch_tpu._internal.distributed import multiprocessing
+
+# Optional third-party packages declared under `[project.optional-dependencies]`
+# in `pyproject.toml` that may not be installed in minimal wheel smoke-test
+# environments.
+_OPTIONAL_EXTERNAL_DEPS: Final[frozenset[str]] = frozenset({
+    "jax",
+    "tensorboardX",
+})
+
+# Sanity check to ensure that some work was done when walking and importing
+# TorchTPU modules. Chosen arbitrarily to be lower than the actual number of
+# modules under the assumption that modules are not likely to be removed.
+_MIN_EXPECTED_MODULES: Final[int] = 20
+
+
+def _is_missing_optional_dep(exc: BaseException) -> bool:
+  """Returns True if `exc` was caused by an uninstalled optional package."""
+  curr: BaseException | None = exc
+  while curr is not None:
+    if isinstance(curr, ModuleNotFoundError) and curr.name:
+      root_pkg = curr.name.partition(".")[0]
+      if (
+          root_pkg in _OPTIONAL_EXTERNAL_DEPS
+          and importlib.util.find_spec(root_pkg) is None
+      ):
+        return True
+    curr = curr.__cause__ or curr.__context__
+  return False
+
+
+def _discover_torch_tpu_modules(package: types.ModuleType) -> Set[str]:
+  """Discovers all importable modules and subpackages under `package`."""
+
+  def _on_error(unused_name: str) -> None:
+    exc = sys.exc_info()[1]
+    if exc is not None and not _is_missing_optional_dep(exc):
+      raise exc
+
+  module_names: set[str] = {package.__name__}
+  for info in pkgutil.walk_packages(
+      getattr(package, "__path__", ()),
+      prefix=f"{package.__name__}.",
+      onerror=_on_error,
+  ):
+    module_names.add(info.name)
+  return module_names
 
 
 def _worker_import_torch_tpu(q):
@@ -60,6 +116,76 @@ def _worker_import_torch_tpu_then_torch(q):
     q.put(traceback.format_exc())
 
 
+def _worker_import_all_submodules(q: queue.Queue[str]) -> None:
+  try:
+    import torch  # pylint: disable=unused-import  # ruff: ignore[unused-import]
+    import torch_tpu
+
+    module_names = _discover_torch_tpu_modules(torch_tpu) | {"torch.tpu"}
+
+    pending_modules: collections.deque[types.ModuleType] = collections.deque()
+    for mod_name in sorted(module_names):
+      try:
+        pending_modules.append(importlib.import_module(mod_name))
+      except ImportError as exc:
+        if _is_missing_optional_dep(exc):
+          continue
+        raise
+
+    visited: set[int] = set()
+    with warnings.catch_warnings():
+      warnings.simplefilter("ignore")
+      while pending_modules:
+        mod = pending_modules.popleft()
+        if id(mod) in visited:
+          continue
+        visited.add(id(mod))
+
+        stages = getattr(mod, "__tt_api_stages__", None)
+        if not isinstance(stages, Mapping):
+          stages = {}
+
+        attr_names = sorted(set(dir(mod)) | set(getattr(mod, "__all__", ())))
+        for attr_name in attr_names:
+          if attr_name.startswith("__") and attr_name.endswith("__"):
+            continue
+          # `_DeviceModuleMeta.__getattr__` invokes `val.__get__(None, cls)` on
+          # property-like descriptors in `__tt_api_stages__` (such as
+          # `_DefaultGeneratorsProperty` for `torch.tpu.default_generators`),
+          # which queries active TPU device state and fails on CPU-only test
+          # runners. Exclude plain Python functions (`types.FunctionType`),
+          # which also implement `__get__` as non-data descriptors.
+          stage_info = stages.get(attr_name)
+          stage_val = getattr(stage_info, "value", None)
+          if (
+              stage_val is not None
+              and not isinstance(stage_val, types.FunctionType)
+              and hasattr(stage_val, "__get__")
+          ):
+            continue
+          try:
+            val = getattr(mod, attr_name)
+          except ImportError as exc:
+            if _is_missing_optional_dep(exc):
+              continue
+            raise
+          if isinstance(val, types.ModuleType) and getattr(
+              val, "__name__", ""
+          ).startswith(("torch_tpu.", "torch.tpu.")):
+            if id(val) not in visited:
+              pending_modules.append(val)
+
+    if len(visited) < _MIN_EXPECTED_MODULES:
+      raise AssertionError(
+          f"Expected to visit at least {_MIN_EXPECTED_MODULES} TorchTPU"
+          f" modules, got {len(visited)}"
+      )
+
+    q.put("OK")
+  except Exception:
+    q.put(traceback.format_exc())
+
+
 def _run_worker(target_fn, q, env_vars):
   if env_vars:
     os.environ.update(env_vars)
@@ -85,6 +211,7 @@ class ImportTest(parameterized.TestCase):  # ABSLTEST_OK=Import test
           _worker_import_torch,
           _worker_import_torch_then_torch_tpu,
           _worker_import_torch_tpu_then_torch,
+          _worker_import_all_submodules,
       ),
       disable_autoload=(False, True),
   )
