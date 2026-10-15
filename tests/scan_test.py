@@ -257,7 +257,8 @@ class ScanOpTest(seed_test_utils.RepeatableTest):
     # PyTorch >= 2.14 (used in Google3 and newest-deps OSS CI) supports it.
     if utils.parse_version(torch.__version__) < (2, 14, 0):
       # The wrapper's validation should raise this error during tracing.
-      with self.assertRaisesRegex(
+      # Also tested in tpu_errors_test.py:test_scan_zero_length_xs.
+      with self.assertRaisesRegex(  # ASSERT_RAISES_OK=Legacy error check on PyTorch < 2.14; also tested in tpu_errors_test.py.
           RuntimeError,
           "All xs leaves must at least have 'dim' number of dimensions and scan"
           " dimension > 0",

@@ -59,7 +59,9 @@ class ModuleRegistryTest(seed_test_utils.RepeatableTest):
     self.module_registry = module_registry.ModuleRegistry()
 
   def test_non_existent_path(self):
-    with self.assertRaises(FileNotFoundError):
+    with self.assertRaises(  # ASSERT_RAISES_OK=Unit test for module registry.
+        FileNotFoundError
+    ):
       module_registry.TimmProvider(base_path="/non/existent/path")
 
   def test_empty_base_path(self):
@@ -202,7 +204,7 @@ class ModuleRegistryTest(seed_test_utils.RepeatableTest):
     self.assertEqual(out.shape, expected_output_shape)
 
   def test_get_module_spec_missing_model_name_raises(self):
-    with self.assertRaisesRegex(
+    with self.assertRaisesRegex(  # ASSERT_RAISES_OK=Unit test for module registry.
         ValueError,
         r"When 'name' is omitted, 'source' must be formatted as"
         r" '{source}/{model_name}', got: 'timm'",
@@ -340,7 +342,9 @@ class ModuleRegistryTest(seed_test_utils.RepeatableTest):
     def modify_config(config):
       return config
 
-    with self.assertRaises(NotImplementedError):
+    with self.assertRaises(  # ASSERT_RAISES_OK=Unit test for module registry.
+        NotImplementedError
+    ):
       self.module_registry.get_module_spec(
           "transformers",
           "google/gemma-3-270m",
@@ -352,7 +356,9 @@ class ModuleRegistryTest(seed_test_utils.RepeatableTest):
     def modify_config(config):
       return config
 
-    with self.assertRaises(ValueError):
+    with self.assertRaises(  # ASSERT_RAISES_OK=Unit test for module registry.
+        ValueError
+    ):
       self.module_registry.get_module_spec(
           "torchvision",
           "convnext_small",
@@ -405,7 +411,9 @@ class ModuleRegistryTest(seed_test_utils.RepeatableTest):
     def modify_config(config):
       return config
 
-    with self.assertRaises(NotImplementedError):
+    with self.assertRaises(  # ASSERT_RAISES_OK=Unit test for module registry.
+        NotImplementedError
+    ):
       self.module_registry.get_module_spec(
           "diffusers",
           "stabilityai/stable-diffusion-xl-base-1.0",
@@ -999,7 +1007,7 @@ class ModuleRegistryTest(seed_test_utils.RepeatableTest):
             "torch_tpu.tests.module_registry._download_gcs_blob",
             return_value=False,
         ):
-          with self.assertRaisesRegex(
+          with self.assertRaisesRegex(  # ASSERT_RAISES_OK=Unit test for module registry.
               ValueError, "could not be loaded from cache or GCS"
           ):
             provider.get_module_spec(model_name)

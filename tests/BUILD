@@ -200,6 +200,21 @@ torch_tpu_py_test(
 )
 
 torch_tpu_py_test(
+    name = "_versioned_so_loader_errors_test",
+    srcs = ["_versioned_so_loader_errors_test.py"],
+    tags = [
+        "nosan",  # *san builds are low-value for error tests.
+    ],
+    deps = [
+        ":seed_test_utils",
+        "//shims/absl_py/testing:absltest",
+        "//shims/absl_py/testing:parameterized",
+        "//src/torch_tpu",
+        "//src/torch_tpu:_versioned_so_loader",
+    ],
+)
+
+torch_tpu_py_test(
     name = "ao_offload_test",
     srcs = ["ao_offload_test.py"],
     tags = ["requires-tpu-v5lite"],
@@ -1757,6 +1772,9 @@ torch_tpu_py_test(
         "//src/torch_tpu/_internal/export",
         "//src/torch_tpu/_internal/pallas",
         "//src/torch_tpu/_internal/pallas:tpu_torch_pallas",  # build_cleaner: keep
+        "//src/torch_tpu/_internal/sync",
+        "//src/torch_tpu/_internal/utils",
+        "//src/torch_tpu/_internal/utils:annotations",
         "//src/torch_tpu/_internal/utils:hardware",
         "//tests/distributed:distributed_utils",
     ],
@@ -1828,6 +1846,9 @@ torch_tpu_py_test(
         "//src/torch_tpu/_internal/export",
         "//src/torch_tpu/_internal/pallas",
         "//src/torch_tpu/_internal/pallas:tpu_torch_pallas",  # build_cleaner: keep
+        "//src/torch_tpu/_internal/sync",
+        "//src/torch_tpu/_internal/utils",
+        "//src/torch_tpu/_internal/utils:annotations",
         "//src/torch_tpu/_internal/utils:hardware",
         "//tests/distributed:distributed_utils",
     ],
@@ -1871,9 +1892,12 @@ torch_tpu_py_test(
 )
 
 torch_tpu_py_test(
-    name = "errors_cpp_context_test",
-    srcs = ["errors_cpp_context_test.py"],
-    tags = ["requires-tpu-v5lite"],
+    name = "errors_cpp_context_errors_test",
+    srcs = ["errors_cpp_context_errors_test.py"],
+    tags = [
+        "nosan",  # *san builds are low-value for error tests.
+        "requires-tpu-v5lite",
+    ],
     deps = [
         ":seed_test_utils",
         "//csrc/eager:tpu_aten_kernels",
@@ -2365,9 +2389,10 @@ torch_tpu_py_test(
 )
 
 torch_tpu_py_test(
-    name = "eager_debug_test",
-    srcs = ["eager_debug_test.py"],
+    name = "eager_debug_errors_test",
+    srcs = ["eager_debug_errors_test.py"],
     tags = [
+        "nosan",  # *san builds are low-value for error tests.
         "requires-tpu-v5lite",
     ],
     deps = [

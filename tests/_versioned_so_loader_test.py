@@ -69,14 +69,6 @@ class ResolveSuffixTest(seed_test_utils.RepeatableTest):
   def test_resolution(self, running, built, expected):
     self.assertEqual(loader.resolve_suffix(running, built), expected)
 
-  @parameterized.named_parameters(
-      ("release_older_than_every_glue", "2_9_0", "predates"),
-      ("undetectable_running_version", None, "could not determine"),
-  )
-  def test_raises_import_error(self, running, message):
-    with self.assertRaisesRegex(ImportError, message):
-      loader.resolve_suffix(running, {"2_11_0", "2_12_0"})
-
 
 class VersionSuffixTest(seed_test_utils.RepeatableTest):
 

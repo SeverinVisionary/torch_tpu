@@ -52,7 +52,9 @@ class PatchTest(seed_test_utils.RepeatableTest):
 
     # Without patching, it should fail to compile with fullgraph=True
     # due to the graph break in _use_grad wrapper
-    with self.assertRaises(Exception):
+    with self.assertRaises(  # ASSERT_RAISES_OK=Unit test for monkey-patching utility.
+        Exception
+    ):
       compiled_step()
 
     # Now apply the patch

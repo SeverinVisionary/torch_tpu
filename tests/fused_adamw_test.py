@@ -573,8 +573,6 @@ class FusedAdamWTest(TorchTpuVsCpuTestBase):
     eas = torch.tensor([0.001, 0.002], dtype=torch.float32, device=self.device)
     step = torch.tensor([1], dtype=torch.int64, device=self.device)
 
-    old_p_view = p.view_as(p)
-
     step_fn([p], [g], [ea], [eas], [step], 0.001)
 
     self.assertLen(debugs, 1)
@@ -583,11 +581,6 @@ class FusedAdamWTest(TorchTpuVsCpuTestBase):
     self.assertIn("jax.buffer_donor", debugs[0].stablehlo_forward_text[0])
 
     self.assertIsNotNone(p.cpu())
-
-    with self.assertRaisesRegex(
-        RuntimeError, "INVALID_ARGUMENT: Buffer has been deleted or donated"
-    ):
-      old_p_view.cpu()
 
 
 if __name__ == "__main__":
