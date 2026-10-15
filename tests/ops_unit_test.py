@@ -8321,6 +8321,90 @@ class OpsUnitTest(TorchTpuVsCpuTestBase):
 
     self.assert_close_tpu_vs_cpu(compute)
 
+  def test_hardsigmoid_backward_nan(self):
+    """Tests hardsigmoid backward returns 0.0 for NaN and Inf inputs."""
+
+    def compute(device) -> torch.Tensor:
+      x = torch.tensor(
+          [
+              float("nan"),
+              -4.0,
+              -3.0,
+              0.0,
+              3.0,
+              4.0,
+              float("inf"),
+              float("-inf"),
+          ],
+          device=device,
+          requires_grad=True,
+      )
+      y = torch.nn.functional.hardsigmoid(x)
+      y.backward(torch.full_like(x, 2.0))
+      return x.grad
+
+    self.assert_close_tpu_vs_cpu(compute)
+
+    def compute_direct(device) -> torch.Tensor:
+      x = torch.tensor(
+          [
+              float("nan"),
+              -4.0,
+              -3.0,
+              0.0,
+              3.0,
+              4.0,
+              float("inf"),
+              float("-inf"),
+          ],
+          device=device,
+      )
+      grad_output = torch.full_like(x, 2.0)
+      return torch.ops.aten.hardsigmoid_backward(grad_output, x)
+
+    self.assert_close_tpu_vs_cpu(compute_direct)
+
+  def test_hardsigmoid_backward_broadcast(self):
+    """Tests hardsigmoid backward with broadcastable inputs."""
+
+    def compute_grad_output_broadcast(device) -> torch.Tensor:
+      grad_output = torch.tensor([2.0], device=device)
+      self_tensor = torch.tensor([-4.0, 0.0, 4.0], device=device)
+      grad_input = torch.empty(3, device=device)
+      torch.ops.aten.hardsigmoid_backward.grad_input(
+          grad_output, self_tensor, grad_input=grad_input
+      )
+      return grad_input
+
+    self.assert_close_tpu_vs_cpu(compute_grad_output_broadcast)
+
+    def compute_self_broadcast(device) -> torch.Tensor:
+      grad_output = torch.tensor([1.0, 2.0, 3.0], device=device)
+      self_tensor = torch.tensor([0.0], device=device)
+      grad_input = torch.empty(3, device=device)
+      torch.ops.aten.hardsigmoid_backward.grad_input(
+          grad_output, self_tensor, grad_input=grad_input
+      )
+      return grad_input
+
+    self.assert_close_tpu_vs_cpu(compute_self_broadcast)
+
+    def compute_multidimensional(device) -> torch.Tensor:
+      grad_output = torch.tensor([[1.0], [2.0]], device=device)
+      self_tensor = torch.tensor([[-4.0, 0.0, 4.0]], device=device)
+      return torch.ops.aten.hardsigmoid_backward(grad_output, self_tensor)
+
+    self.assert_close_tpu_vs_cpu(compute_multidimensional)
+
+    def compute_mixed_dtype(device) -> torch.Tensor:
+      grad_output = torch.tensor([2.0], dtype=torch.float32, device=device)
+      self_tensor = torch.tensor(
+          [0.0, 1.0], dtype=torch.bfloat16, device=device
+      )
+      return torch.ops.aten.hardsigmoid_backward(grad_output, self_tensor)
+
+    self.assert_close_tpu_vs_cpu(compute_mixed_dtype)
+
   @parameterized.product(dtype=[torch.float32, torch.bfloat16])
   def test_hardswish(self, dtype):
     # Scale by 5 to have coverage of the x < -3 and x >= 3 piecewise branches

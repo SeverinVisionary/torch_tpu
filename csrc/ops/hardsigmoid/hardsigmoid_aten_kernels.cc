@@ -16,17 +16,15 @@
 
 #include "csrc/ops/hardsigmoid/hardsigmoid_aten_kernels.h"
 
-#include <utility>
-
 #include "ATen/core/TensorBody.h"
 #include "absl/status/statusor.h"
+#include "c10/core/ScalarType.h"
 #include "csrc/common/aten_utils.h"
 #include "csrc/common/cache_key.h"
 #include "csrc/common/dtype.h"
 #include "csrc/common/error_utils.h"
-#include "csrc/common/fixed_size_span.h"
 #include "csrc/common/to_string.h"
-#include "csrc/eager/op_dispatcher.h"
+#include "csrc/ops/binary_aten_kernels.h"
 #include "csrc/ops/macros/kernel.h"
 #include "csrc/ops/op_builder_utils.h"
 #include "csrc/ops/op_names.h"
@@ -36,6 +34,7 @@
 #include "stablehlo/integrations/cpp/builder/AttrTypeBuilderUtil.h"
 #include "stablehlo/integrations/cpp/builder/MlirBuilder.h"
 #include "stablehlo/integrations/cpp/builder/StablehloBuilder.h"
+#include "torch/headeronly/core/ScalarType.h"
 
 namespace torch_tpu {
 namespace {
@@ -63,32 +62,40 @@ absl::StatusOr<mlir::MlirOp> BuildHardsigmoidShlo(mlir::MlirOp input_op) {
 
 absl::StatusOr<mlir::MlirOp> BuildHardsigmoidBackwardShlo(
     mlir::MlirOp grad_output, mlir::MlirOp self) {
-  auto type = GetTensorTypeOrDie(self);
-  TT_ASSIGN_OR_RETURN(auto element_type,
-                      ConvertTo<mlir::ElementType>(type.getElementType()));
+  TT_ASSIGN_OR_RETURN((auto [bcast_g, bcast_x]),
+                      ApplyBroadcastIfNeeded(grad_output, self));
 
-  TT_ASSIGN_OR_RETURN(auto compute_dtype, InferComputationDtype(element_type));
-  TT_ASSIGN_OR_RETURN(mlir::MlirOp g, CastIfNeeded(grad_output, compute_dtype));
-  TT_ASSIGN_OR_RETURN(mlir::MlirOp x, CastIfNeeded(self, compute_dtype));
+  const mlir::ElementType g_dtype = GetElementTypeOrDie(bcast_g);
+  const mlir::ElementType x_dtype = GetElementTypeOrDie(bcast_x);
+
+  const at::ScalarType g_scalar = ConvertTo<at::ScalarType>(g_dtype);
+  const at::ScalarType x_scalar = ConvertTo<at::ScalarType>(x_dtype);
+  const at::ScalarType common_scalar = c10::promoteTypes(g_scalar, x_scalar);
+  TT_ASSIGN_OR_RETURN(const mlir::ElementType common_dtype,
+                      ConvertTo<mlir::ElementType>(common_scalar));
+
+  TT_ASSIGN_OR_RETURN(const auto compute_dtype,
+                      InferComputationDtype(common_dtype));
+  TT_ASSIGN_OR_RETURN(mlir::MlirOp g, CastIfNeeded(bcast_g, compute_dtype));
+  TT_ASSIGN_OR_RETURN(mlir::MlirOp x, CastIfNeeded(bcast_x, compute_dtype));
 
   // grad = 1/6 if -3 < x < 3 else 0
   mlir::MlirOp neg_three = MakeConstantLike(x, -3.0, compute_dtype);
   mlir::MlirOp three = MakeConstantLike(x, 3.0, compute_dtype);
 
-  mlir::MlirOp cond_le = mlir::stablehlo::Compare(
-      x, neg_three, mlir::stablehlo::ComparisonDirection::LE);
-  mlir::MlirOp cond_ge = mlir::stablehlo::Compare(
-      x, three, mlir::stablehlo::ComparisonDirection::GE);
+  mlir::MlirOp cond_gt = mlir::stablehlo::Compare(
+      x, neg_three, mlir::stablehlo::ComparisonDirection::GT);
+  mlir::MlirOp cond_lt = mlir::stablehlo::Compare(
+      x, three, mlir::stablehlo::ComparisonDirection::LT);
+  mlir::MlirOp in_bounds = mlir::stablehlo::And(cond_gt, cond_lt);
 
   mlir::MlirOp zero = MakeConstantLike(x, 0.0, compute_dtype);
   mlir::MlirOp one_sixth = MakeConstantLike(x, 1.0 / 6.0, compute_dtype);
 
   mlir::MlirOp mid_grad = mlir::stablehlo::Mul(g, one_sixth);
+  mlir::MlirOp result = mlir::stablehlo::Select(in_bounds, mid_grad, zero);
 
-  mlir::MlirOp out_of_bounds = mlir::stablehlo::Or(cond_le, cond_ge);
-  mlir::MlirOp result = mlir::stablehlo::Select(out_of_bounds, zero, mid_grad);
-
-  return CastIfNeeded(result, element_type);
+  return CastIfNeeded(result, common_dtype);
 }
 
 }  // namespace
@@ -114,20 +121,9 @@ at::Tensor& AtenHardsigmoidBackwardGradInput(const at::Tensor& grad_output,
               TT_CHECK_THROW(self.is_floating_point(), error::kInvalidArgument)
                   << "expected the input dtype to be floating point, got "
                   << ToString(self.scalar_type());
-              TT_ASSIGN_OR_THROW(
-                  const auto output_mlir_type,
-                  ConvertTo<mlir::ElementType>(self.scalar_type()));
-              auto op_builder = [](FixedSizeSpan<mlir::MlirOp, 2> inputs)
-                  -> absl::StatusOr<mlir::MlirOp> {
-                auto& [grad_output_op, self_op] = inputs;
-                return BuildHardsigmoidBackwardShlo(grad_output_op, self_op);
-              };
-
-              TT_THROW_IF_ERROR(DispatchOpOut<2>(
-                  std::move(op_builder), {grad_output, self}, grad_input,
-                  {.out_dtype = output_mlir_type,
-                   .out_dims = self.sizes(),
-                   .op_param_cache_keys = OpParamCacheKeys::Empty()}));
+              TT_THROW_IF_ERROR(BinaryOpOut(
+                  grad_output, self, grad_input, BuildHardsigmoidBackwardShlo,
+                  {.op_param_cache_keys = OpParamCacheKeys::Empty()}));
               return grad_input;
             });
 }
