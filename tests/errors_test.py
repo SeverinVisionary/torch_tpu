@@ -4100,12 +4100,7 @@ Device-side assertion tracking was not enabled by user.""",
       torch.linspace(0, 10, 5, out=out)
 
   def test_arange_infinite_inputs(self):
-    """Tests that arange fails on infinite inputs with expected error.
-
-    The test for when `step` is infinite is skipped because PyTorch CPU does not
-    error in this case. Such a test is in
-    `TpuErrorsTest.test_arange_infinite_step`.
-    """
+    """Tests that arange fails on infinite inputs with expected error."""
 
     with et.assert_raises_message(
         RuntimeError,
@@ -4144,23 +4139,32 @@ Device-side assertion tracking was not enabled by user.""",
       torch.arange(10, 0, 1, device=et.device())
 
   def test_arange_invalid_inputs_with_infinite_step(self):
-    """Tests that arange fails on invalid sets of inputs with infinite step.
-
-    Tests whether the given `step` (infinite) sign is valid for the given
-    interval [start, end]. i.e. `step` should be negative infinity iff `start` >
-    `end`, but positive infinity iff `start` < `end`.
-    """
+    """Tests that arange fails on invalid sets of inputs with infinite step."""
 
     with et.assert_raises_message(
         RuntimeError,
-        tpu="""arange(): expected step to be positive since start (0) < end (10), got step=-inf""",
+        tpu="""arange(): expected step to be finite, got inf""",
+        gpu="""step must be finite but got inf""",
+    ):
+      torch.arange(10, 20, float("inf"), device=et.device())
+
+    with et.assert_raises_message(
+        RuntimeError,
+        tpu="""arange(): expected step to be finite, got -inf""",
+        gpu="""step must be finite but got -inf""",
+    ):
+      torch.arange(20, 10, float("-inf"), device=et.device())
+
+    with et.assert_raises_message(
+        RuntimeError,
+        tpu="""arange(): expected step to be finite, got -inf""",
         gpu="""step must be finite but got -inf""",
     ):
       torch.arange(0, 10, float("-inf"), device=et.device())
 
     with et.assert_raises_message(
         RuntimeError,
-        tpu="""arange(): expected step to be negative since start (10) > end (0), got step=inf""",
+        tpu="""arange(): expected step to be finite, got inf""",
         gpu="""step must be finite but got inf""",
     ):
       torch.arange(10, 0, float("inf"), device=et.device())

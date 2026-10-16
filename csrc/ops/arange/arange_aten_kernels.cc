@@ -51,7 +51,7 @@ namespace {
 // Check that the inputs are valid for the arange operation.
 //
 // It makes sure that:
-// - step is non-zero
+// - step is finite and non-zero
 // - The bounds are consistent with the step sign
 // - If the bounds are floating-point, they are finite
 //
@@ -65,6 +65,9 @@ namespace {
 template <typename RangeBound>
 absl::Status ValidateArangeInputs(const RangeBound start, const RangeBound end,
                                   const double step) {
+  TT_RET_CHECK(std::isfinite(step), error::kInvalidArgument)
+      << "expected step to be finite, got " << step;
+
   TT_RET_CHECK(step != 0, error::kInvalidArgument)
       << "expected step to be non-zero, got " << step;
 

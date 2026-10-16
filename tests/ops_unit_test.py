@@ -10778,15 +10778,14 @@ class OpsUnitTest(TorchTpuVsCpuTestBase):
         )
     )
 
-  @absltest.skip("b/535216136")
-  def test_arange_infinite_step(self):
-    """Tests arange where step is infinite."""
+  def test_arange_fractional_step(self):
+    """Tests arange with fractional start, end, and step."""
 
     def _test_positive(device):
-      return torch.arange(10, 20, float("inf"), device=device)
+      return torch.arange(0.5, 3.5, 0.5, device=device)
 
     def _test_negative(device):
-      return torch.arange(20, 10, float("-inf"), device=device)
+      return torch.arange(3.5, 0.5, -0.5, device=device)
 
     self.assert_close_tpu_vs_cpu(_test_positive)
     self.assert_close_tpu_vs_cpu(_test_negative)
