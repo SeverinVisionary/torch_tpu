@@ -41,6 +41,7 @@ from torch_tpu._internal.compile.compiler import StaticCompiler
 from torch_tpu._internal.distributed import distributed as internal_distributed
 from torch_tpu._internal.export import export as torch_tpu_export
 from torch_tpu._internal.pallas import tpu_torch_pallas
+from torch_tpu._internal.sync import sync
 from torch_tpu._internal.utils import hardware
 from torch_tpu._internal.distributed import multiprocessing
 from tests import error_testing as et
@@ -2378,6 +2379,26 @@ Please use clone() or contiguous() to copy the tensor before writing""",
         torch.accelerator.synchronize()
     finally:
       tt_testing.clear_sticky_error()
+
+  @et.why_tpu_only("Sync materialization status checks are TPU-specific.")
+  def test_is_materializing_tensor_not_on_tpu(self):
+    """Tests is_materializing throws on a tensor not on PrivateUse1."""
+    x = torch.ones(10, device="cpu")
+    with et.assert_raises_message(
+        RuntimeError,
+        tpu="""is_materializing(): tensor is not on the PrivateUse1 device""",
+    ):
+      sync.is_materializing(x)
+
+  @et.why_tpu_only("Sync materialization status checks are TPU-specific.")
+  def test_is_materialized_tensor_not_on_tpu(self):
+    """Tests is_materialized throws on a tensor not on PrivateUse1."""
+    x = torch.ones(10, device="cpu")
+    with et.assert_raises_message(
+        RuntimeError,
+        tpu="""is_materialized(): tensor is not on the PrivateUse1 device""",
+    ):
+      sync.is_materialized(x)
 
   @et.why_tpu_only("TODO: investigate why this is TPU-only.")
   def test_execute_output_shapes_rank_mismatch(self):
