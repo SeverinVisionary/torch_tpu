@@ -150,4 +150,26 @@ torch_tpu_py_test(
     ],
 )
 
+torch_tpu_py_test(
+    name = "profiler_errors_test",
+    srcs = ["profiler_errors_test.py"],
+    main = "profiler_errors_test.py",
+    tags = [
+        "nosan",  # *san builds are low-value for error tests.
+        "requires-tpu-v5lite",
+    ],
+    deps = [
+        "//csrc/eager:tpu_aten_kernels",
+        "//shims/absl_py/testing:absltest",
+        "//shims/absl_py/testing:parameterized",
+        "//shims/torch:pytorch",
+        "//src/torch_tpu",
+        "//src/torch_tpu/_internal:testing",
+        "//src/torch_tpu/_internal/profiler",
+        "//src/torch_tpu/_internal/profiler:profiler_config",
+        "//tests:seed_test_utils",
+        "@pypi//portpicker",
+    ],
+)
+
 torch_tpu_package_end()
