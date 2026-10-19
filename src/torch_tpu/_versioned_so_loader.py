@@ -16,10 +16,13 @@
 
 torch_tpu bundles a thin `.so` glue per supported PyTorch build, each named
 `<module>_<major>_<minor>_<patch>.so` (e.g. `env_2_12_0.so`). A
-`MetaPathFinder` installed at import time rewrites imports of
-`torch_tpu._internal.<module>` to the glue that matches the installed PyTorch,
-and an `ExtensionProxyLoader` bridges the artifact's version-suffixed filename
-to the unversioned `PyInit_<module>` symbol the C++ code actually exports.
+`PathEntryFinder` installed on `sys.path_hooks` at import time rewrites imports
+and `pkgutil` module discovery inside `torch_tpu` to the glue that matches the
+installed PyTorch, and an `ExtensionProxyLoader` bridges the artifact's
+version-suffixed filename to the unversioned `PyInit_<module>` symbol the C++
+code actually exports. Version-suffixed glue filenames are hidden from
+`pkgutil.iter_modules` and `pkgutil.walk_packages` and cannot be imported
+directly by their suffixed names.
 
 Selection policy: a new glue is added to the wheel only when a PyTorch release
 breaks ABI compatibility with the previous glue, so each glue serves every
@@ -40,21 +43,16 @@ by that snapshot's release triple, like any other glue -- serves it whenever
 present.
 """
 
-from collections.abc import Collection
+from collections.abc import Collection, Iterator, Set
 import importlib.abc
 import importlib.machinery
 import importlib.metadata
 import importlib.util
+import inspect
 import pathlib
 import re
 import sys
-from typing import Final
-
-_INTERNAL_PREFIX: Final[str] = "torch_tpu._internal."
-
-# Resolved once by install_hook(): the suffix of the glue variant this process
-# loads, or None when dispatch is disabled.
-_VERSION_SUFFIX: str | None = None
+import types
 
 
 def _parse(suffix: str) -> tuple[int, ...]:
@@ -224,66 +222,194 @@ class ExtensionProxyLoader(importlib.abc.Loader):
     return getattr(self._real_loader, item)
 
 
-class VersionDispatchFinder(importlib.abc.MetaPathFinder):
-  """Redirects `torch_tpu._internal.<m>` imports to the resolved glue."""
+def _is_within(entry: str, package_dir: pathlib.Path) -> bool:
+  """Returns whether `entry` is `package_dir` or a directory inside it."""
+  return pathlib.Path(entry).resolve().is_relative_to(package_dir.resolve())
 
-  def find_spec(self, fullname, path, target=None):
-    """Redirects a `torch_tpu._internal` import to its versioned artifact.
 
-    Args:
-      fullname: the fully qualified name of the module being imported.
-      path: the parent package's `__path__`, as supplied by the import system.
-      target: an existing module the import updates (only set for reloads);
-        forwarded to the underlying PathFinder lookup.
+def _is_package_dir(path: pathlib.Path) -> bool:
+  """Returns whether `path` is a package directory (has an `__init__` module)."""
+  return (
+      path.is_dir()
+      and "." not in path.name
+      and any(
+          inspect.getmodulename(child.name) == "__init__"
+          for child in path.iterdir()
+      )
+  )
 
-    Returns:
-      A spec whose loader creates the module from the version-suffixed
-      artifact under its unversioned name, or None to let the normal finders
-      handle the import (dispatch disabled, a name outside
-      `torch_tpu._internal`, or no versioned artifact for this module).
+
+def _default_path_entry_finder(path: str) -> importlib.abc.PathEntryFinder:
+  """Returns the finder that standard `sys.path_hooks` would create for `path`."""
+  for hook in sys.path_hooks:
+    if isinstance(hook, _VersionDispatchPathHook):
+      continue
+    try:
+      finder = hook(path)
+    except ImportError:
+      continue
+    if isinstance(finder, importlib.abc.PathEntryFinder):
+      return finder
+  raise ImportError("no default path entry finder for directory", path=path)
+
+
+class VersionDispatchPathEntryFinder(importlib.abc.PathEntryFinder):
+  """Path entry finder that dispatches unversioned names to the active glue.
+
+  Wraps a standard `FileFinder` by composition (rather than subclassing, since
+  `pkgutil.iter_importer_modules` is a `@singledispatch` function registered on
+  `FileFinder` that bypasses `iter_modules` overrides on subclasses) for a
+  single directory inside `torch_tpu`. Unversioned extension names resolve to
+  `<name>_<resolved_suffix>.so` via `ExtensionProxyLoader`, direct imports of
+  `<name>_<any_built_suffix>` are hidden, and `iter_modules` yields each
+  versioned extension once under its unversioned name.
+  """
+
+  def __init__(
+      self,
+      path: str,
+      resolved_suffix: str,
+      built_suffixes: Set[str],
+  ) -> None:
+    self.path = path
+    self._dir = pathlib.Path(path)
+    self._resolved_suffix = resolved_suffix
+    self._built_suffixes = built_suffixes
+    self._file_finder = _default_path_entry_finder(path)
+
+  def _is_glue_module(self, modname: str) -> bool:
+    """Returns whether `modname` is a versioned glue in `self.path`."""
+    suffix = _glue_suffix(f"{modname}.so")
+    return (
+        suffix is not None
+        and suffix in self._built_suffixes
+        and (self._dir / f"{modname}.so").is_file()
+    )
+
+  def find_spec(
+      self,
+      fullname: str,
+      target: types.ModuleType | None = None,
+  ) -> importlib.machinery.ModuleSpec | None:
+    tail = fullname.rpartition(".")[2]
+    if self._is_glue_module(tail):
+      return None
+
+    # Match FileFinder and iter_modules precedence: a package directory
+    # (`tail/__init__.*`) wins over a same-named extension module.
+    if _is_package_dir(self._dir / tail):
+      return self._file_finder.find_spec(fullname, target)
+
+    versioned_tail = f"{tail}_{self._resolved_suffix}"
+    if self._is_glue_module(versioned_tail):
+      versioned_name = f"{fullname}_{self._resolved_suffix}"
+      spec = self._file_finder.find_spec(versioned_name, target)
+      if spec is not None and spec.loader is not None:
+        is_pkg = spec.submodule_search_locations is not None
+        new_spec = importlib.util.spec_from_loader(
+            fullname,
+            ExtensionProxyLoader(spec.loader, fullname, versioned_name),
+            origin=spec.origin,
+            is_package=is_pkg,
+        )
+        if new_spec is not None:
+          new_spec.has_location = spec.has_location
+          new_spec.submodule_search_locations = spec.submodule_search_locations
+        return new_spec
+
+    return self._file_finder.find_spec(fullname, target)
+
+  def _iter_raw_modules(self) -> Iterator[tuple[str, bool]]:
+    """Yields `(modname, ispkg)` for entries in `self.path`, like `FileFinder`.
+
+    This mirrors `pkgutil._iter_file_finder_modules` rather than calling
+    `pkgutil.iter_importer_modules(self._file_finder)` directly because
+    `iter_importer_modules` is undocumented, excluded from `pkgutil.__all__`,
+    and absent from typeshed.
     """
-    if _VERSION_SUFFIX is None or not fullname.startswith(_INTERNAL_PREFIX):
-      return None
-    # Avoid infinite recursion when we look up the versioned name ourselves.
-    if fullname.endswith(f"_{_VERSION_SUFFIX}"):
-      return None
+    for entry_path in sorted(self._dir.iterdir()):
+      fn = entry_path.name
+      modname = inspect.getmodulename(fn)
+      if modname == "__init__":
+        continue
 
-    versioned_name = f"{fullname}_{_VERSION_SUFFIX}"
-    spec = importlib.machinery.PathFinder.find_spec(
-        versioned_name, path, target
-    )
-    if spec is None:
-      # No versioned artifact for this name (e.g. a pure-Python submodule);
-      # let the normal finders resolve it.
-      return None
+      ispkg = False
+      if not modname and _is_package_dir(entry_path):
+        modname = fn
+        ispkg = True
 
-    is_pkg = getattr(spec, "submodule_search_locations", None) is not None
-    new_spec = importlib.util.spec_from_loader(
-        fullname,
-        ExtensionProxyLoader(spec.loader, fullname, versioned_name),
-        origin=spec.origin,
-        is_package=is_pkg,
+      if modname and "." not in modname:
+        yield modname, ispkg
+
+  def iter_modules(self, prefix: str = "") -> Iterator[tuple[str, bool]]:
+    seen: dict[str, bool] = {}
+    active_tail = f"_{self._resolved_suffix}"
+    for modname, ispkg in self._iter_raw_modules():
+      if not ispkg and self._is_glue_module(modname):
+        if not modname.endswith(active_tail):
+          continue
+        modname = modname.removesuffix(active_tail)
+      seen.setdefault(modname, ispkg)
+    for modname in sorted(seen):
+      yield f"{prefix}{modname}", seen[modname]
+
+  def invalidate_caches(self) -> None:
+    self._file_finder.invalidate_caches()
+
+
+class _VersionDispatchPathHook:
+  """`sys.path_hooks` callable for directories inside `package_dir`."""
+
+  def __init__(
+      self,
+      package_dir: pathlib.Path,
+      resolved_suffix: str,
+      built_suffixes: Set[str],
+  ) -> None:
+    self.package_dir = package_dir
+    self.resolved_suffix = resolved_suffix
+    self.built_suffixes = built_suffixes
+
+  def __call__(self, path: str) -> VersionDispatchPathEntryFinder:
+    if not pathlib.Path(path).is_dir():
+      raise ImportError("only directories are supported", path=path)
+    if not _is_within(path, self.package_dir):
+      raise ImportError("not inside torch_tpu package", path=path)
+    return VersionDispatchPathEntryFinder(
+        path,
+        self.resolved_suffix,
+        self.built_suffixes,
     )
-    new_spec.has_location = getattr(spec, "has_location", False)  # pyrefly: ignore[missing-attribute]
-    new_spec.submodule_search_locations = getattr(  # pyrefly: ignore[missing-attribute]
-        spec, "submodule_search_locations", None
-    )
-    return new_spec
 
 
 def install_hook(package_dir: pathlib.Path) -> None:
-  """Selects the matching glue variant and installs the import hook.
+  """Selects the matching glue variant and installs the path import hook.
 
   Args:
     package_dir: the torch_tpu package directory to scan for versioned glues.
   """
-  global _VERSION_SUFFIX
-  resolved = resolve_suffix(
-      torch_version_suffix(),
-      discover_built_suffixes(package_dir),
-  )
+  built_suffixes = discover_built_suffixes(package_dir)
+  resolved = resolve_suffix(torch_version_suffix(), built_suffixes)
   if resolved is None:
     return
-  _VERSION_SUFFIX = resolved
-  if not any(isinstance(f, VersionDispatchFinder) for f in sys.meta_path):
-    sys.meta_path.insert(0, VersionDispatchFinder())
+
+  package_dir_resolved = package_dir.resolve()
+  hook = _VersionDispatchPathHook(package_dir, resolved, built_suffixes)
+  sys.path_hooks[:] = [
+      existing
+      for existing in sys.path_hooks
+      if not (
+          isinstance(existing, _VersionDispatchPathHook)
+          and existing.package_dir.resolve() == package_dir_resolved
+      )
+  ]
+  # Must precede the default FileFinder path hook, which would otherwise claim
+  # package_dir first.
+  sys.path_hooks.insert(0, hook)
+
+  # Evict any cached FileFinder for package_dir or its subdirectories (for
+  # example, torch_tpu/__init__.py imports _tcmalloc_check before calling
+  # install_hook, which populates sys.path_importer_cache[str(package_dir)]).
+  for cached_path in list(sys.path_importer_cache):
+    if _is_within(cached_path, package_dir):
+      del sys.path_importer_cache[cached_path]
