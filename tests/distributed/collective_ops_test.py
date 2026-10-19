@@ -735,19 +735,6 @@ def run_barrier_with_device_ids(async_op: bool) -> None:
   )
 
 
-def run_barrier_rejects_foreign_device_ids() -> None:
-  """Tests barrier rejects device ids this process does not own."""
-  # A process addresses a single TPU, so only [0] is meaningful; a foreign
-  # index or more than one id must still be rejected.
-  for device_ids in ([1], [0, 0]):
-    with absltest.TestCase().assertRaisesRegex(  # ABSLTEST_OK=just using helper
-        NotImplementedError,
-        r"device_ids in barrier options is not supported, except "
-        r"device_ids=\[0\] which names this process's own device",
-    ):
-      torch.distributed.barrier(device_ids=device_ids)
-
-
 def run_barrier_blocking(async_op: bool) -> None:
   """Tests barrier functionality blocks."""
   rank = int(os.environ["RANK"])
@@ -1089,13 +1076,6 @@ class CollectiveOpsTest(seed_test_utils.MultiProcessRepeatableTest):
         fn=_test_wrapper,
         test_fn=run_barrier_with_device_ids,
         async_op=async_op,
-    )
-
-  def test_barrier_rejects_foreign_device_ids(self):
-    distributed_utils.dist_run(
-        nproc_per_node=self._world_size,
-        fn=_test_wrapper,
-        test_fn=run_barrier_rejects_foreign_device_ids,
     )
 
   @absltest.skipIf(_IS_TPU_V7, _SKIP_P2P_ON_TPU_V7_REASON)

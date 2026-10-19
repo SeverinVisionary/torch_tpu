@@ -44,7 +44,6 @@ from tests import error_testing as et
 from tests.distributed import continuous_test_utils
 from tests.distributed import distributed_utils
 
-
 _UNSUPPORTED_64BIT_REDUCE_OPS = (
     (
         torch.int64,
@@ -577,8 +576,22 @@ def run_scatter_mismatch_input_shapes() -> None:
   # Intentionally do NOT call scatter on non-root ranks.
 
 
+def run_barrier_rejects_foreign_device_ids() -> None:
+  """Tests barrier rejects device ids this process does not own."""
+  for device_ids in ([1], [0, 0]):
+    with et.assert_raises_message(
+        NotImplementedError,
+        tpu=re.compile(
+            r".*device_ids in barrier options is not supported, except "
+            r"device_ids=\[0\] which names this process's own device"
+        ),
+    ):
+      torch.distributed.barrier(device_ids=device_ids)
+
+
 def run_collective_validation_errors() -> None:
   """Runs synchronous collective input validation error checks."""
+  run_barrier_rejects_foreign_device_ids()
   run_all_reduce_error()
   run_all_gather_tensor_wrong_number_output_dimensions()
   run_all_gather_tensor_wrong_concat_dimension()
