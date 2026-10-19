@@ -16,7 +16,6 @@
 
 import enum
 import functools
-import os
 import pathlib
 import sys
 from typing import Optional, Sequence, Tuple, TypeAlias
@@ -26,7 +25,6 @@ from absl.testing import absltest
 import jax
 from jax.experimental import pallas as pl
 import jax.numpy as jnp
-from packaging import version
 import torch
 import torch._library.custom_ops as torch_custom_ops
 import torch.distributed as dist
@@ -140,7 +138,7 @@ class TestPallasKernels(seed_test_utils.RepeatableTest):
     self.device = torch.device("tpu")
 
   def _assert_donated(self, x: torch.Tensor):
-    with self.assertRaisesRegex(
+    with self.assertRaisesRegex(  # ASSERT_RAISES_OK=Testing buffer donation
         RuntimeError, "INVALID_ARGUMENT: Buffer has been deleted or donated"
     ):
       x.cpu()
@@ -640,23 +638,6 @@ class TestPallasKernels(seed_test_utils.RepeatableTest):
     z = kernel_op(x)
     test_utils.assert_close(z.cpu(), x.cpu() + 1)
 
-  def test_symbolic_shape_raises_error(self):
-    symbolic_shape = torch.fx.experimental.symbolic_shapes
-    shape_env = symbolic_shape.ShapeEnv()
-
-    x = torch.randn(5, device=self.device)
-    with torch._subclasses.FakeTensorMode(shape_env=shape_env) as mode:
-      fake_x = mode.from_tensor(
-          x,
-          symbolic_context=symbolic_shape.StatelessSymbolicContext(
-              dynamic_sizes=[symbolic_shape.DimDynamic.DYNAMIC]
-          ),
-      )
-      with self.assertRaisesRegex(
-          RuntimeError, "Symbolic dimensions are not supported"
-      ):
-        pass_through(fake_x)
-
   def test_fake_tensor_on_tpu(self):
     x = torch.randn(5, device="tpu")
     with torch._subclasses.FakeTensorMode() as mode:
@@ -714,19 +695,6 @@ class TestPallasKernels(seed_test_utils.RepeatableTest):
     actual_sum = aliased_add_vectors_sum(x, y)
     test_utils.assert_close(actual_sum.to("cpu"), expected_sum)
     test_utils.assert_close(x.to("cpu"), expected_updated_x)
-
-  def test_inconsistent_donate_and_aliases_raises_error(self):
-    with self.assertRaisesRegex(
-        ValueError,
-        "donate_argnums must be None or the same as the keys of"
-        " input_output_aliases.",
-    ):
-      pallas.custom_jax_kernel(
-          add_vectors_jax,
-          name="add_vectors",
-          input_output_aliases={0: 0},
-          donate_argnums=(1,),
-      )
 
   def test_jax_dot_grad_for_backwards(self):
     """Test usage of jax.grad to generate a backwards function.
@@ -982,29 +950,6 @@ class TestPallasKernels(seed_test_utils.RepeatableTest):
       self.assertEqual(grad_x.item(), 2.0 * -37.0 - 3.0)
       # grad_y = grad_mul * x + grad_add (passes straight through)
       self.assertEqual(grad_y.item(), 2.0 * -4.0 - 3.0)
-
-  def test_custom_call(self):
-    is_oss = os.getenv("IS_OSS", "0") == "1"
-    jax_version = version.Version(jax.__version__)
-    if is_oss and jax_version < version.Version("0.10.3"):
-      self.skipTest("Jax version doesn't support custom_call export.")
-
-    def custom_call_fn(x: jax.Array) -> jax.Array:
-      return jax.ffi.ffi_call(
-          "test_custom_call", jax.ShapeDtypeStruct(x.shape, x.dtype)
-      )(x)
-
-    custom_call_op = pallas.jax_op("test::custom_call", custom_call_fn)
-
-    # Check that it successfully reaches XLA and raises an error.
-    with self.assertRaisesRegex(
-        RuntimeError,
-        expected_regex="""failed to compile MLIR module -- the XLA compiler failed with: custom emitter for test_custom_call not found""",
-    ):
-      x = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32, device=self.device)
-      y = custom_call_op(x)
-      y.cpu()
-    tt_testing.reset_eager_state()
 
   def test_wrapper_tensor_support(self):
 
@@ -1319,27 +1264,6 @@ class TestPallasCompat(seed_test_utils.RepeatableTest):
 
     self.assertEqual(out.dtype, torch.float4_e2m1fn_x2)
     self.assertEqual(out.shape, fp4_t.shape)
-
-  def test_fp4_non_contiguous_error(self):
-
-    u8_t = torch.zeros((8, 256), dtype=torch.uint8)
-    fp4_t = u8_t.view(torch.float4_e2m1fn_x2).to("tpu")
-
-    # Transpose to make it non-contiguous
-    fp4_t_transposed = fp4_t.t()
-    self.assertFalse(fp4_t_transposed.is_contiguous())
-
-    def fn_identity(x: jax.Array) -> jax.Array:
-      return x
-
-    op = pallas.jax_op("repro::identity_error", fn_identity)
-
-    with self.assertRaisesRegex(
-        ValueError,
-        "expected packed dimension of float4_e2m1fn_x2 tensor to be "
-        "contiguous \\(stride 1\\)",
-    ):
-      op(fp4_t_transposed)
 
   def test_fp4_outer_non_contiguous_supported(self):
 

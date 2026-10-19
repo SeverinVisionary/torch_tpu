@@ -56,6 +56,28 @@ torch_tpu_py_test(
         "//src/torch_tpu/_internal/utils:test_utils",
         "//tests:seed_test_utils",
         "@pypi//jax",
+    ],
+)
+
+torch_tpu_py_test(
+    name = "pallas_errors_test",
+    srcs = ["pallas_errors_test.py"],
+    env = {
+        "IS_OSS": if_oss("1", "0"),
+        "TPU_PREMAPPED_BUFFER_SIZE": "0",
+    },
+    tags = [
+        "nosan",  # *san builds are low-value for error tests.
+        "requires-tpu-v5lite",
+    ],
+    deps = [
+        "//shims/absl_py/testing:absltest",
+        "//shims/torch:pytorch",
+        "//src/torch_tpu",
+        "//src/torch_tpu/_internal:testing",
+        "//src/torch_tpu/_internal/pallas",
+        "//tests:seed_test_utils",
+        "@pypi//jax",
         "@pypi//packaging",
     ],
 )
