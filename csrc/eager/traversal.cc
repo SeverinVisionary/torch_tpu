@@ -60,7 +60,7 @@
 #include "csrc/ops/op_builder_utils.h"
 #include "csrc/ops/op_names.h"
 #include "csrc/ops/python_context.h"
-#include "csrc/pjrt/pjrt_state.h"
+#include "csrc/pjrt/pjrt_utils.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
@@ -88,7 +88,6 @@
 #include "tsl/profiler/lib/traceme.h"
 #include "xla/client/executable_build_options.h"
 #include "xla/layout.h"
-#include "xla/pjrt/pjrt_client.h"
 #include "xla/service/device_assignment.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
@@ -793,39 +792,6 @@ std::vector<Shape> GetShapes(absl::Span<const DeviceBufferRef> buffers) {
   return shapes;
 }
 
-bool IsDefaultDeviceLayout(const DeviceBufferRef& buffer,
-                           const CustomLayout& layout) {
-  const absl::StatusOr<xla::PjRtClient* absl_nonnull> client_or =
-      PjrtBackend::GetInstance().GetClient();
-  if (!client_or.ok()) {
-    ABSL_LOG_FIRST_N(WARNING, 1)
-        << "IsDefaultDeviceLayout: PjRt backend unavailable: "
-        << client_or.status();
-    return false;
-  }
-  xla::PjRtClient* const client = *client_or;
-  const xla::PrimitiveType element_type =
-      ConvertTo<xla::PrimitiveType>(buffer.element_type());
-  const absl::StatusOr<xla::Layout> default_layout_or =
-      client->GetDefaultLayout(element_type, buffer.dimensions());
-  if (!default_layout_or.ok()) {
-    return false;
-  }
-  const xla::Layout& default_layout = *default_layout_or;
-  if (layout.minor_to_major != default_layout.minor_to_major()) {
-    return false;
-  }
-  if (layout.tiles.size() != default_layout.tiles().size()) {
-    return false;
-  }
-  for (size_t i = 0; i < layout.tiles.size(); ++i) {
-    if (layout.tiles[i] != default_layout.tiles()[i].dimensions()) {
-      return false;
-    }
-  }
-  return true;
-}
-
 void AnnotateArgumentLayouts(mlir::ModuleOp module,
                              absl::Span<const DeviceBufferRef> arguments,
                              absl::Span<const CustomLayout> argument_layouts) {
@@ -872,7 +838,8 @@ void AnnotateOutputLayouts(mlir::ModuleOp module,
     if (!outputs[i].shape().layout().has_value()) continue;
     const CustomLayout& layout = *outputs[i].shape().layout();
     if (!layout.minor_to_major.empty() &&
-        !IsDefaultDeviceLayout(outputs[i], layout)) {
+        !IsDefaultDeviceLayout(layout, outputs[i].element_type(),
+                               outputs[i].dimensions())) {
       main.setResultAttr(i, "mhlo.layout_mode",
                          builder.getStringAttr(ToXlaLayout(layout).ToString()));
     }

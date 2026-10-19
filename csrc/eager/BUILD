@@ -1015,7 +1015,7 @@ torch_tpu_cc_library(
         "//csrc/ops:op_builder_utils",
         "//csrc/ops:op_names",
         "//csrc/ops:python_context",
-        "//csrc/pjrt:pjrt_state",
+        "//csrc/pjrt:pjrt_utils",
         "@com_google_absl//absl/algorithm:container",
         "@com_google_absl//absl/base:nullability",
         "@com_google_absl//absl/container:flat_hash_map",
@@ -1044,7 +1044,6 @@ torch_tpu_cc_library(
         "@xla//xla:side_effect_util",
         "@xla//xla:xla_data_proto_cc",
         "@xla//xla/client:executable_build_options",
-        "@xla//xla/pjrt:pjrt_client",
         "@xla//xla/service:device_assignment",
     ],
 )
