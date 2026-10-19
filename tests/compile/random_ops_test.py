@@ -72,7 +72,9 @@ class RandomOpsTest(seed_test_utils.RepeatableTest):
         torch.manual_seed(seed)
       curr_outs = _get_cpu_tensors(runner())
       if prev_outs is not None:
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(  # ASSERT_RAISES_OK=Verifying test assertion on distinct RNG outputs.
+            AssertionError
+        ):
           utils.assert_close(curr_outs, prev_outs, atol=atol, rtol=rtol)
       prev_outs = curr_outs
 

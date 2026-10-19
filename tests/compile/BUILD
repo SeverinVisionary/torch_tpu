@@ -658,6 +658,28 @@ torch_tpu_py_test(
 )
 
 torch_tpu_py_test(
+    name = "compile_errors_test",
+    srcs = ["compile_errors_test.py"],
+    tags = [
+        "nosan",  # *san builds are low-value for error tests.
+        "requires-tpu-v5lite",
+    ],
+    deps = [
+        "//shims/absl_py/testing:absltest",
+        "//shims/torch:pytorch",
+        "//src/torch_tpu",
+        "//src/torch_tpu/_internal:testing",
+        "//src/torch_tpu/_internal/compile",
+        "//src/torch_tpu/_internal/compile:compiler",
+        "//src/torch_tpu/_internal/compile:torch_tpu_compiled_executable",
+        "//src/torch_tpu/_internal/compile:tpu_torch_compile",  # buildcleaner: keep
+        "//src/torch_tpu/_internal/compile/fx_passes:sink_get_attr_constants",
+        "//src/torch_tpu/_internal/execution_mode",
+        "//tests:seed_test_utils",
+    ],
+)
+
+torch_tpu_py_test(
     name = "jagged_compile_test",
     srcs = ["jagged_compile_test.py"],
     # Run on single-chip TPU v7 for faster TorchDynamo/Inductor compilation

@@ -674,7 +674,9 @@ class CompiledRngTest(_BaseRngTest):
     def fn_pass_gen(x, gen):
       return torch.rand_like(x, generator=gen)
 
-    with self.assertRaises(torch._dynamo.exc.Unsupported):
+    with self.assertRaises(  # ASSERT_RAISES_OK=Shared TPU/CUDA reference test run under rng_cuda_ref_test_cuda; also tested in compile_errors_test.py.
+        torch._dynamo.exc.Unsupported
+    ):
       torch.compile(fn_pass_gen, fullgraph=True)(x, g)
 
   def test_compiled_manual_seed_inside_fn_triggers_graph_break(self):
@@ -685,7 +687,9 @@ class CompiledRngTest(_BaseRngTest):
       torch.manual_seed(42)
       return torch.rand_like(x)
 
-    with self.assertRaises(torch._dynamo.exc.Unsupported):
+    with self.assertRaises(  # ASSERT_RAISES_OK=Shared TPU/CUDA reference test run under rng_cuda_ref_test_cuda; also tested in compile_errors_test.py.
+        torch._dynamo.exc.Unsupported
+    ):
       torch.compile(fn_manual_seed, fullgraph=True)(x)
 
   def test_compiled_generator_instantiation_inside_fn_triggers_graph_break(
@@ -698,7 +702,9 @@ class CompiledRngTest(_BaseRngTest):
       g = torch.Generator(device=self.device)
       return torch.rand_like(x, generator=g)
 
-    with self.assertRaises(torch._dynamo.exc.Unsupported):
+    with self.assertRaises(  # ASSERT_RAISES_OK=Shared TPU/CUDA reference test run under rng_cuda_ref_test_cuda; also tested in compile_errors_test.py.
+        torch._dynamo.exc.Unsupported
+    ):
       torch.compile(fn_create_gen, fullgraph=True)(x)
 
   def test_compiled_manual_seed_supported_with_graph_breaks(self):
@@ -761,7 +767,9 @@ class CompiledRngTest(_BaseRngTest):
       _ = g.graphsafe_get_state()
       return torch.rand_like(x)
 
-    with self.assertRaises(torch._dynamo.exc.Unsupported):
+    with self.assertRaises(  # ASSERT_RAISES_OK=Shared TPU/CUDA reference test run under rng_cuda_ref_test_cuda; also tested in compile_errors_test.py.
+        torch._dynamo.exc.Unsupported
+    ):
       torch.compile(fn_get_state, fullgraph=True)(x)
 
   def test_compiled_graphsafe_set_state_triggers_graph_break(self):
@@ -779,7 +787,9 @@ class CompiledRngTest(_BaseRngTest):
       g.graphsafe_set_state(saved_state)
       return torch.rand_like(x)
 
-    with self.assertRaises(torch._dynamo.exc.Unsupported):
+    with self.assertRaises(  # ASSERT_RAISES_OK=Shared TPU/CUDA reference test run under rng_cuda_ref_test_cuda; also tested in compile_errors_test.py.
+        torch._dynamo.exc.Unsupported
+    ):
       torch.compile(fn_set_state, fullgraph=True)(x)
 
   def test_compiled_generator_supported_with_graph_breaks(self):
@@ -846,6 +856,7 @@ class CompiledRngTest(_BaseRngTest):
   )
   def test_compiled_activation_checkpointing_dropout(self):
     """Verifies non-reentrant activation checkpointing reproduces the mask."""
+
     class CheckpointModel(torch.nn.Module):
 
       def __init__(self):

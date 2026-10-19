@@ -126,28 +126,6 @@ class CompileApiTest(seed_test_utils.RepeatableTest):
     self.assertLen(results_pass, 1)
     results_pass[0].cpu()  # Verify it passes
 
-    # Case 2: Force non-default layout [0, 1]. Execution should FAIL with
-    # default input.
-    with eager_mode_compile_fx_graph():
-      x2 = torch.ones(2, 3, device='cpu').to(device=torch.device('tpu'))
-      z2 = x2 + x2
-
-    compile_result_fail = tpu_torch_compile.traverse_and_compile(
-        [z2], [x2], argument_layouts=[[0, 1]]
-    )
-    self.assertIsNotNone(compile_result_fail.executable)
-
-    results_fail = tpu_torch_compile.execute(
-        compile_result_fail.executable, [input_tensor]
-    )
-    self.assertLen(results_fail, 1)
-
-    with self.assertRaises(RuntimeError) as err:
-      results_fail[0].cpu()
-
-    self.assertIn('layout', str(err.exception).lower())
-    tt_testing.reset_eager_state()
-
   def test_compilation_cache_with_forced_layouts(self):
     # Enable cache (should be enabled by default, but let's be sure)
     torch.tpu._set_allow_cache(True)
@@ -1697,11 +1675,6 @@ class CompileApiTest(seed_test_utils.RepeatableTest):
 
     utils.assert_close(res[0].cpu(), expected_add)
     utils.assert_close(res[1].cpu(), expected_mul)
-
-    with self.assertRaisesRegex(
-        RuntimeError, 'INVALID_ARGUMENT: Buffer has been deleted or donated'
-    ):
-      x.cpu()
 
     # y should still be accessible
     y.cpu()
