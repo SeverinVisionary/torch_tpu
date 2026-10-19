@@ -90,6 +90,7 @@ torch_tpu_py_library(
     deps = [
         ":graph_transform_context",
         ":sym_utils",
+        ":symbol_bounds",
         "//shims/absl_py/logging",
         "//shims/torch:pytorch",
     ],

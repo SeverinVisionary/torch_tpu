@@ -55,6 +55,7 @@ class _CaptureDone(Exception):
 def _capture_and_run_slice_pass(
     fn: Callable[..., Any],
     inputs: list[torch.Tensor],
+    bucket_idx: int | None = None,
 ) -> _PassResult:
   """Captures the FX graph via aot_autograd and runs HandleSliceLikeOpsPass.
 
@@ -71,8 +72,14 @@ def _capture_and_run_slice_pass(
     shape_env = torch._guards.detect_fake_mode(example_inputs).shape_env
     num_guards = len(shape_env.guards)
     bm = sym_bounds_manager.SymBoundsManager(example_inputs)
+    if bucket_idx is None:
+      bounds = bm.get_fallback_symbol_bounds()
+    else:
+      bounds = bm.get_bucketed_symbol_bounds([], num_buckets=bucket_idx + 1)[
+          bucket_idx
+      ]
     ctx = graph_transform_context.GraphTransformContext(
-        graph_module, example_inputs, bm.get_fallback_symbol_bounds()
+        graph_module, example_inputs, bounds
     )
     placeholders = list(
         graph_module.graph.find_nodes(op="placeholder", sort=True)
@@ -211,6 +218,24 @@ class HandleSliceLikeOpsPassTest(seed_test_utils.RepeatableTest):
         sliced_input.target,
         (torch.ops.aten.cat.default, torch.ops.aten.cat),
     )
+
+  def test_pass_does_not_pad_when_bucket_capacity_exceeds_slice_clamp(
+      self,
+  ) -> None:
+    buf = torch.ones(4, 200)
+    x = torch.ones(4, 16)
+    torch._dynamo.mark_static(buf)
+    torch._dynamo.mark_dynamic(x, 1)
+
+    result = _capture_and_run_slice_pass(
+        lambda b_in, x_in: b_in[:, x_in.shape[1] : x_in.shape[1] + 1] * 2.0,
+        [buf, x],
+        bucket_idx=1,
+    )
+
+    slice_node = self._assert_single_dynamic_slice(result)
+    sliced_input = slice_node.args[0]
+    self.assertEqual(sliced_input.op, "placeholder")
 
   def test_pass_adds_no_guards_for_1d_tail_slice(self) -> None:
     # cache_position[-q_len:] with independent kv/q symbols: at head the pass

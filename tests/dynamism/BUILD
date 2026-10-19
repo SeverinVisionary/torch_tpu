@@ -48,10 +48,15 @@ torch_tpu_py_test(
 torch_tpu_py_test(
     name = "multi_bucket_compile_test",
     srcs = ["multi_bucket_compile_test.py"],
+    oss_presubmit_tpu_generation = tpu_gen(
+        "v7",
+        reason = "Faster dynamic shape compilation on single-chip TPU v7",
+    ),
     tags = [
         "requires-tpu-v5lite",
     ],
     deps = [
+        "//shims/absl_py/logging",
         "//shims/absl_py/testing:absltest",
         "//shims/torch:pytorch",
         "//src/torch_tpu",

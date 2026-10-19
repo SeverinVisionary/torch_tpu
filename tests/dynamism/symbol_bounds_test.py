@@ -352,6 +352,131 @@ class SymbolBoundsTest(seed_test_utils.RepeatableTest):
         ],
     )
 
+  @parameterized.named_parameters(
+      # The clamp from a static buffer of size 2054 sliced by `s0 + 1` gives s0
+      # the unaligned cap 2053. In the second bucket s0 gets the aligned
+      # capacity 2175 like the unbounded s1, not 2053: XLA derives the layout
+      # of a bounded output from its bound, and a capacity in a different
+      # alignment class than the previous bucket recompiles the bucket at the
+      # step after the switch.
+      dict(
+          testcase_name="unaligned_cap_second_bucket",
+          upper=2053,
+          num_buckets=2,
+          expected_s0_bounds=[(2, 2047), (2048, 2175)],
+          expected_s1_bounds=[(2, 2047), (2048, 2175)],
+      ),
+      # The cap is reached in a middle bucket, which is clamped to the aligned
+      # capacity and then kept while s1 keeps stepping.
+      dict(
+          testcase_name="unaligned_cap_middle_bucket",
+          upper=2053,
+          num_buckets=3,
+          expected_s0_bounds=[(2, 2047), (2048, 2175), (2048, 2175)],
+          expected_s1_bounds=[(2, 2047), (2048, 2175), (2176, 2303)],
+      ),
+      # A cap that is already aligned is unchanged.
+      dict(
+          testcase_name="aligned_cap",
+          upper=2175,
+          num_buckets=3,
+          expected_s0_bounds=[(2, 2047), (2048, 2175), (2048, 2175)],
+          expected_s1_bounds=[(2, 2047), (2048, 2175), (2176, 2303)],
+      ),
+      # A cap above the last aligned step extends the last bucket to its
+      # aligned capacity (capacity overshoot < bucket_step).
+      dict(
+          testcase_name="unaligned_cap_above_last_bucket",
+          upper=2200,
+          num_buckets=2,
+          expected_s0_bounds=[(2, 2047), (2048, 2303)],
+          expected_s1_bounds=[(2, 2047), (2048, 2175)],
+      ),
+      # The first bucket keeps the exact user-declared max (single bucket).
+      dict(
+          testcase_name="unaligned_cap_single_bucket",
+          upper=2053,
+          num_buckets=1,
+          expected_s0_bounds=[(2, 2053)],
+          expected_s1_bounds=[(2, 2047)],
+      ),
+  )
+  def test_get_bucketed_symbol_bounds_aligned_capacity_after_first_bucket(
+      self, upper, num_buckets, expected_s0_bounds, expected_s1_bounds
+  ):
+    shape_env = FakeShapeEnv()
+    s0_symint, s0 = _make_symint(
+        "s0", hint=2044, lower=2, upper=upper, shape_env=shape_env
+    )
+    s1_symint, s1 = _make_symint(
+        "s1", hint=2044, lower=2, upper=int_oo, shape_env=shape_env
+    )
+    # Outputs of length `s + 1` (torch.cat growth) give the `128k - 1` grid.
+    out_shape = output_sym_shape.OutputSymShape(
+        [{"expr": s0 + 1}, {"expr": s1 + 1}]
+    )
+
+    bm = sym_bounds_manager.SymBoundsManager([s0_symint, s1_symint])
+    buckets = bm.get_bucketed_symbol_bounds(
+        [out_shape], num_buckets=num_buckets
+    )
+
+    self.assertEqual(
+        [b.get_symint_bounds(s0_symint) for b in buckets], expected_s0_bounds
+    )
+    self.assertEqual(
+        [b.get_symint_bounds(s1_symint) for b in buckets], expected_s1_bounds
+    )
+
+  def test_get_bucketed_symbol_bounds_unaligned_mark_dynamic_max(self):
+    # `mark_dynamic(min=2, max=200)` with outputs of length `s0 + 1`: the first
+    # bucket keeps the usual clamp and the second bucket's capacity is the
+    # aligned 255 (>= 200), so the bound checks stay implied by the declared
+    # range (no guard, no Dynamo constraint violation).
+    s0_symint, s0 = _make_symint("s0", hint=100, lower=2, upper=200)
+    out_shape = output_sym_shape.OutputSymShape([{"expr": s0 + 1}])
+
+    bm = sym_bounds_manager.SymBoundsManager([s0_symint])
+    self.assertEqual(
+        [
+            b.get_symint_bounds(s0_symint)
+            for b in bm.get_bucketed_symbol_bounds([out_shape], num_buckets=2)
+        ],
+        [(2, 127), (128, 255)],
+    )
+    self.assertEqual(
+        [
+            b.get_symint_bounds(s0_symint)
+            for b in bm.get_bucketed_symbol_bounds([out_shape], num_buckets=1)
+        ],
+        [(2, 200)],
+    )
+
+  def test_get_bucketed_symbol_bounds_aligned_capacity_above_slice_clamp(self):
+    # `buffer[:, :, s0:s0 + 1]` on a static buffer of size 2054 installs the
+    # guards `s0 <= 2054` and `s0 + 1 <= 2054` and refines the range to
+    # s0 <= 2053. The aligned second-bucket capacity 2175 exceeds that range
+    # but must not count as a guard violation (which would drop bucketing).
+    s0 = sympy.Symbol("s0", integer=True)
+    shape_env = FakeShapeEnv(
+        guards=[
+            FakeGuard(sympy.Le(s0, 2054)),
+            FakeGuard(sympy.Le(s0 + 1, 2054)),
+        ]
+    )
+    s0_symint, _ = _make_symint(
+        "s0", hint=2044, lower=2, upper=2053, shape_env=shape_env
+    )
+    out_shape = output_sym_shape.OutputSymShape([{"expr": s0 + 1}])
+
+    bm = sym_bounds_manager.SymBoundsManager([s0_symint])
+    buckets = bm.get_bucketed_symbol_bounds([out_shape], num_buckets=2)
+
+    self.assertEqual(
+        [b.get_symint_bounds(s0_symint) for b in buckets],
+        [(2, 2047), (2048, 2175)],
+    )
+
   def test_get_bucketed_symbol_bounds_returns_empty_on_guard_violation(self):
     s0 = sympy.Symbol("s0", integer=True)
     guard = FakeGuard(sympy.Eq(sympy.Mod(s0, 3), 0))

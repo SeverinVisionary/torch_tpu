@@ -22,6 +22,7 @@ from absl import logging
 import torch
 import torch.utils._pytree as pytree
 from torch_tpu._internal.compile.dynamic import sym_utils
+from torch_tpu._internal.compile.dynamic import symbol_bounds
 from torch_tpu._internal.compile.dynamic.graph_transform_context import GraphTransformContext
 
 
@@ -337,6 +338,14 @@ class HandleSliceLikeOpsPass:
 
     inp_dim_ub = ub_shape[dim]
     start_ub = max(0, self._transform_context.get_upper_bound(start))
+    # `start` is a runtime index, not a padded extent: Dynamo's guards keep it
+    # within its ShapeEnv range, so pad for that range rather than for the
+    # bucket capacity, which may overshoot it (`runtime_ub` is `int_oo` when
+    # the range has no finite upper bound).
+    if isinstance(start, torch.SymInt):
+      _, runtime_ub = symbol_bounds.get_symint_bounds(start)
+      if isinstance(runtime_ub, int):
+        start_ub = min(start_ub, max(0, runtime_ub))
     extra = start_ub + slice_extent - inp_dim_ub
     if slice_extent == 0 or extra <= 0:
       return curr
