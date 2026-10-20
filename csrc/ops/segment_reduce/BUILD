@@ -46,7 +46,6 @@ torch_tpu_cc_library(
         "//csrc/ops/cumsum",
         "//csrc/ops/macros:kernel",
         "//shims/torch:aten_headers",
-        "//shims/torch:torch_headers",
         "//shims/torch/c10/core:base_headers",
         "//shims/torch/c10/util:base_headers",
         "@com_google_absl//absl/status:statusor",

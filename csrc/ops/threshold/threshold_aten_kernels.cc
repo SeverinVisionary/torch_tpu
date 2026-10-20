@@ -86,7 +86,7 @@ at::Tensor& AtenThresholdOut(const at::Tensor& self,
                            ConvertTo<mlir::ElementType>(out.scalar_type()));
 
         auto op_builder = [](FixedSizeSpan<mlir::MlirOp, 3> inputs) {
-          auto [input, threshold, value] = inputs;
+          auto& [input, threshold, value] = inputs;
           return BuildThresholdShlo(input, threshold, value);
         };
 
@@ -117,7 +117,7 @@ at::Tensor& AtenThresholdBackwardGradInput(const at::Tensor& grad_output,
             ConvertTo<mlir::ElementType>(grad_input.scalar_type()));
 
         auto op_builder = [](FixedSizeSpan<mlir::MlirOp, 3> inputs) {
-          auto [grad_output, self, threshold] = inputs;
+          auto& [grad_output, self, threshold] = inputs;
           return BuildThresholdBackwardShlo(grad_output, self, threshold);
         };
 

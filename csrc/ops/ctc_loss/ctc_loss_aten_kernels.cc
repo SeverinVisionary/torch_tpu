@@ -1785,12 +1785,10 @@ at::Tensor AtenCtcLossBackwardTensor(
         TT_ASSIGN_OR_THROW(
             mlir::ElementType output_dtype,
             ConvertTo<mlir::ElementType>(log_probs.scalar_type()));
-        const Dimensions grad_in_dims = {log_probs.size(0), log_probs.size(1),
-                                         log_probs.size(2)};
 
         DispatchOpOptions<1> options = {
             .out_dtype = output_dtype,
-            .out_dims = absl::MakeConstSpan(grad_in_dims),
+            .out_dims = log_probs.sizes(),
             .op_param_cache_keys = std::move(param_keys),
         };
 
