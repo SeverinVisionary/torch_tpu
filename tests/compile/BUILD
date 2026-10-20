@@ -218,6 +218,34 @@ torch_tpu_py_test(
         "//shims/torch:pytorch",
         "//src/torch_tpu",
         "//src/torch_tpu/_internal/compile:debug",
+        "//src/torch_tpu/_internal/compile/fx_passes:mark_activation_checkpoints",
+        "//src/torch_tpu/_internal/utils:test_utils",
+        "//tests:seed_test_utils",
+    ],
+)
+
+torch_tpu_py_test(
+    name = "upstream_activation_checkpointing_test",
+    timeout = "long",
+    srcs = ["upstream_activation_checkpointing_test.py"],
+    # Run on single-chip TPU v7 for faster TorchDynamo/Inductor compilation
+    # and to utilize idle single-chip v7 runner capacity in OSS presubmit.
+    oss_presubmit_tpu_generation = tpu_gen(
+        "v7",
+        reason = "Faster TorchDynamo/Inductor compilation on single-chip TPU v7",
+    ),
+    tags = [
+        "requires-net:external",
+        "requires-tpu-v5lite",
+    ],
+    deps = [
+        "//shims/absl_py/testing:absltest",
+        "//shims/absl_py/testing:parameterized",
+        "//shims/torch:pytorch",
+        "//src/torch_tpu",
+        "//src/torch_tpu/_internal/compile",
+        "//src/torch_tpu/_internal/compile/fx_passes:mark_activation_checkpoints",
+        "//src/torch_tpu/_internal/utils:test_utils",
         "//tests:seed_test_utils",
     ],
 )
@@ -241,6 +269,7 @@ torch_tpu_py_test(
         "//shims/absl_py/testing:absltest",
         "//shims/torch:pytorch",
         "//src/torch_tpu",
+        "//src/torch_tpu/_internal/compile/fx_passes:mark_activation_checkpoints",
         "//src/torch_tpu/_internal/distributed:multiprocessing",
         "//tests:seed_test_utils",
     ],
