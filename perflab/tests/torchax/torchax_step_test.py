@@ -33,9 +33,10 @@ import torchax
 
 class DummyModelOutput:
 
-  def __init__(self, logits=None, loss=None, to_tuple_data=None):
+  def __init__(self, logits=None, loss=None, sample=None, to_tuple_data=None):
     self.logits = logits
     self.loss = loss
+    self.sample = sample
     self._to_tuple_data = to_tuple_data
 
   def to_tuple(self):
@@ -93,6 +94,10 @@ class TorchaxStepTest(seed_test_utils.RepeatableTest):
     # Output with .loss attribute
     out_loss = DummyModelOutput(loss=t2)
     self.assertIs(torchax_step._extract_jax_compatible_output(out_loss), t2)
+
+    # Output with .sample attribute
+    out_sample = DummyModelOutput(sample=t1)
+    self.assertIs(torchax_step._extract_jax_compatible_output(out_sample), t1)
 
     # Output with both .loss and .logits attributes (e.g., HF CausalLMOutputWithPast
     # during training) must prioritize .loss over .logits.
@@ -166,6 +171,21 @@ class TorchaxStepTest(seed_test_utils.RepeatableTest):
     out_dict = {"loss": t_2d}
     self.assertEqual(torchax_step._default_loss_fn(out_dict).item(), 2.5)
 
+    # From attribute .sample (including dict with loss=None)
+    class DictWithSample(dict):
+
+      def __init__(self, sample):
+        super().__init__(loss=None)
+        self.sample = sample
+
+    self.assertEqual(
+        torchax_step._default_loss_fn(DictWithSample(t_2d)).item(), 2.5
+    )
+    self.assertEqual(
+        torchax_step._default_loss_fn({"loss": None, "sample": t_2d}).item(),
+        2.5,
+    )
+
     # From tuple/list first item
     out_list = [t_2d, "extra"]
     self.assertEqual(torchax_step._default_loss_fn(out_list).item(), 2.5)
@@ -218,6 +238,7 @@ class TorchaxStepTest(seed_test_utils.RepeatableTest):
     step_fn = wrapper.get_step_fn()
     out = step_fn()
     self.assertIsNotNone(out)
+    self.assertFalse(out.requires_grad)
 
     # Test compile with STEP scope
     compile_config = compile_lib.CompileConfig(scope=compile_lib.Scope.STEP)

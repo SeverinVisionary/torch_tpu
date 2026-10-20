@@ -721,6 +721,103 @@ class StepperTypeTest(seed_test_utils.RepeatableTest):
     stepper.compile(compile_config, target)
     self.assertIsNone(stepper._trainer)
 
+  def test_training_stepper_falls_back_on_unsupported_optimizer(self):
+    ops = self._ops()
+    model = _mlp(seed=42).to(ops.device)
+    opt = torch.optim.RMSprop(model.parameters(), lr=1e-3)
+    stepper = step_lib.resolve_stepper(
+        step_lib.StepperType.TRAINING,
+        compute_loss=mock_grad_probe,
+    )
+    x = torch.randn(4, 4, device=ops.device)
+    stepper.init_with_benchmark_args(model, (x,), {}, opt)
+    target = target_lib.make_target(platform=target_lib.Platform.V5E_1X1)
+    compile_config = compile_lib.CompileConfig(
+        scope=compile_lib.Scope.STEP, dynamic=False
+    )
+    stepper.compile(compile_config, target)
+    self.assertIsNone(stepper._trainer)
+    loss = stepper.get_step_fn()()
+    self.assertIsNotNone(loss)
+
+  def test_training_stepper_falls_back_on_adam_with_weight_decay(self):
+    ops = self._ops()
+    model = _mlp(seed=42).to(ops.device)
+    for opt in (
+        torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-2),
+        torch.optim.AdamW(model.parameters(), lr=1e-3, amsgrad=True),
+    ):
+      stepper = step_lib.resolve_stepper(
+          step_lib.StepperType.TRAINING,
+          compute_loss=mock_grad_probe,
+      )
+      x = torch.randn(4, 4, device=ops.device)
+      stepper.init_with_benchmark_args(model, (x,), {}, opt)
+      target = target_lib.make_target(platform=target_lib.Platform.V5E_1X1)
+      compile_config = compile_lib.CompileConfig(
+          scope=compile_lib.Scope.STEP, dynamic=False
+      )
+      stepper.compile(compile_config, target)
+      self.assertIsNone(stepper._trainer)
+      loss = stepper.get_step_fn()()
+      self.assertIsNotNone(loss)
+
+  def test_single_trace_training_handles_none_dict_loss_with_sample(self):
+    ops = self._ops()
+    base_mlp = _mlp(seed=42).to(ops.device)
+
+    class SampleDictModel(nn.Module):
+
+      def __init__(self, inner):
+        super().__init__()
+        self.inner = inner
+
+      def forward(self, x):
+        return {"loss": None, "sample": self.inner(x)}
+
+    model = SampleDictModel(base_mlp)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    x = torch.randn(4, 4, device=ops.device)
+    with torch.no_grad():
+      expected_loss = base_mlp(x).mean()
+
+    stepper = step_lib.resolve_stepper(step_lib.StepperType.TRAINING)
+    stepper.init_with_benchmark_args(model, (x,), {}, opt)
+    target = target_lib.make_target(platform=target_lib.Platform.V5E_1X1)
+    compile_config = compile_lib.CompileConfig(
+        scope=compile_lib.Scope.STEP, dynamic=False
+    )
+    stepper.compile(compile_config, target)
+    self.assertIsNotNone(stepper._trainer)
+    loss = stepper.get_step_fn()()
+    test_utils.assert_close(loss, expected_loss)
+
+  def test_single_trace_training_supports_positional_and_keyword_inputs(self):
+    ops = self._ops()
+    model = _mlp(seed=42).to(ops.device)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=0.0)
+    x = torch.randn(4, 4, device=ops.device)
+    scale = torch.tensor(2.0, device=ops.device)
+
+    def compute_loss(m, args, kwargs):
+      return (m(*args) * kwargs["scale"]).sum()
+
+    stepper = step_lib.resolve_stepper(
+        step_lib.StepperType.TRAINING,
+        compute_loss=compute_loss,
+    )
+    with torch.no_grad():
+      expected_loss = compute_loss(model, (x,), {"scale": scale})
+    stepper.init_with_benchmark_args(model, (x,), {"scale": scale}, opt)
+    target = target_lib.make_target(platform=target_lib.Platform.V5E_1X1)
+    compile_config = compile_lib.CompileConfig(
+        scope=compile_lib.Scope.STEP, dynamic=False
+    )
+    stepper.compile(compile_config, target)
+    self.assertIsNotNone(stepper._trainer)
+    loss = stepper.get_step_fn()()
+    test_utils.assert_close(loss, expected_loss)
+
   def test_decode_safe_get_helper(self):
     # Object with first attribute present
     class ConfigA:

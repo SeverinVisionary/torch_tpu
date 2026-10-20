@@ -283,11 +283,67 @@ class LoadModelTest(seed_test_utils.RepeatableTest):
 
   def test_presubmit_keeps_two_layers(self):
     model = self._load_text(
-        types.SimpleNamespace(num_hidden_layers=12),
+        types.SimpleNamespace(
+            num_hidden_layers=12,
+            text_config=types.SimpleNamespace(num_hidden_layers=12),
+            vision_config=types.SimpleNamespace(num_hidden_layers=12, depth=12),
+        ),
         context_lib.RunScope.PRESUBMIT,
     )
 
+    self.assertEqual(model.config.dtype, torch.bfloat16)
+    self.assertEqual(model.config.torch_dtype, torch.bfloat16)
+    self.assertEqual(model.config.text_config.dtype, torch.bfloat16)
+    self.assertEqual(model.config.text_config.torch_dtype, torch.bfloat16)
+    self.assertEqual(model.config.vision_config.dtype, torch.bfloat16)
+    self.assertEqual(model.config.vision_config.torch_dtype, torch.bfloat16)
     self.assertEqual(model.config.num_hidden_layers, 2)
+    self.assertEqual(model.config.text_config.num_hidden_layers, 2)
+    self.assertEqual(model.config.vision_config.num_hidden_layers, 2)
+    self.assertEqual(model.config.vision_config.depth, 2)
+
+  def test_set_config_dtype_updates_pretrained_config_property_and_dicts(self):
+    class _FakePretrainedConfig:
+      """Mirrors HF PretrainedConfig where torch_dtype is a dtype property."""
+
+      def __init__(self, dtype=torch.float32, text_config=None):
+        self.dtype = dtype
+        self.text_config = text_config
+
+      @property
+      def torch_dtype(self):
+        return self.dtype
+
+      @torch_dtype.setter
+      def torch_dtype(self, value):
+        self.dtype = value
+
+    # Simulate _ConfigWrapper.__setattr__ writing directly to __dict__.
+    class _DictWritingWrapper:
+
+      def __init__(self, data):
+        object.__setattr__(self, "_data", data)
+
+      def __getattr__(self, name):
+        val = getattr(self._data, name)
+        if isinstance(val, _FakePretrainedConfig):
+          return _DictWritingWrapper(val)
+        return val
+
+      def __setattr__(self, name, value):
+        self._data.__dict__[name] = value
+
+    raw_cfg = _FakePretrainedConfig(
+        dtype=torch.float32,
+        text_config={"dtype": torch.float32, "torch_dtype": torch.float32},
+    )
+    wrapped = _DictWritingWrapper(raw_cfg)
+    load_model._set_config_dtype(wrapped, torch.bfloat16)
+
+    self.assertEqual(raw_cfg.dtype, torch.bfloat16)
+    self.assertEqual(raw_cfg.torch_dtype, torch.bfloat16)
+    self.assertEqual(raw_cfg.text_config["dtype"], torch.bfloat16)
+    self.assertEqual(raw_cfg.text_config["torch_dtype"], torch.bfloat16)
 
   def test_presubmit_keeps_a_layer_per_dpt_neck_stage(self):
     # The config of Intel/dpt-hybrid-midas.

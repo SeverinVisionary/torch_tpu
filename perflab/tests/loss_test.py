@@ -101,6 +101,31 @@ class LossTest(seed_test_utils.RepeatableTest):
         loss_lib.real_loss(M(), (torch.tensor([1.0, 3.0]),), {}).item(), 2.0
     )
 
+  def test_real_loss_ignores_none_dict_loss_and_falls_back_to_sample(self):
+    class _SampleOutputWithNoneLoss(collections.OrderedDict):
+
+      def __init__(self, sample):
+        super().__init__(loss=None, sample=sample)
+        self.loss = None
+        self.sample = sample
+
+    class M(nn.Module):
+
+      def forward(self, x):
+        return _SampleOutputWithNoneLoss(sample=x)
+
+    self.assertAlmostEqual(
+        loss_lib.real_loss(M(), (torch.tensor([2.0, 6.0]),), {}).item(), 4.0
+    )
+
+    plain_dict_model = lambda x: {"loss": None, "sample": x}
+    self.assertAlmostEqual(
+        loss_lib.real_loss(
+            plain_dict_model, (torch.tensor([2.0, 6.0]),), {}
+        ).item(),
+        4.0,
+    )
+
   def test_real_loss_rejects_diffusers_output_without_sample(self):
     class _SampleOutput(collections.OrderedDict):
 

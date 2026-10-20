@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+from typing import Any
 from absl import logging
 import torch
 from perflab import loss as loss_lib
@@ -77,12 +78,13 @@ class _StandardTrainingStepper(common.BaseStepper):
 
 
 def _to_single_trace_optimizer(
-    optimizer, use_bfloat16_moments: bool = False
+    optimizer: Any = None, use_bfloat16_moments: bool = False
 ) -> single_trace_trainer_adapter.Optimizer:
   """Converts a torch.optim.Optimizer into a SingleTraceTrainer Optimizer."""
   if isinstance(optimizer, single_trace_trainer_adapter.Optimizer):
     return optimizer
   defaults = getattr(optimizer, "defaults", {})
+  param_groups = getattr(optimizer, "param_groups", ())
   if isinstance(optimizer, torch.optim.SGD):
     return single_trace_trainer_adapter.Sgd(
         lr=defaults.get("lr", 1e-3),
@@ -94,15 +96,65 @@ def _to_single_trace_optimizer(
         foreach=defaults.get("foreach", False),
         fused=defaults.get("fused", True),
     )
-  beta1, beta2 = defaults.get("betas", (0.9, 0.999))
-  return single_trace_trainer_adapter.ReferenceAdamW(
-      lr=defaults.get("lr", 1e-4),
-      weight_decay=defaults.get("weight_decay", 1e-2),
-      beta1=beta1,
-      beta2=beta2,
-      eps=defaults.get("eps", 1e-8),
-      use_bfloat16_moments=use_bfloat16_moments,
+  if defaults.get("amsgrad", False) or defaults.get("maximize", False):
+    raise ValueError(
+        "Unsupported Adam/AdamW options (amsgrad or maximize) for"
+        f" SingleTraceTrainer: {type(optimizer).__name__}"
+    )
+  if optimizer is None or isinstance(optimizer, torch.optim.AdamW):
+    beta1, beta2 = defaults.get("betas", (0.9, 0.999))
+    return single_trace_trainer_adapter.ReferenceAdamW(
+        lr=defaults.get("lr", 1e-4),
+        weight_decay=defaults.get("weight_decay", 1e-2),
+        beta1=beta1,
+        beta2=beta2,
+        eps=defaults.get("eps", 1e-8),
+        use_bfloat16_moments=use_bfloat16_moments,
+    )
+  if (
+      isinstance(optimizer, torch.optim.Adam)
+      and defaults.get("weight_decay", 0.0) == 0.0
+      and all(
+          isinstance(g, dict) and g.get("weight_decay", 0.0) == 0.0
+          for g in param_groups
+      )
+  ):
+    beta1, beta2 = defaults.get("betas", (0.9, 0.999))
+    return single_trace_trainer_adapter.ReferenceAdamW(
+        lr=defaults.get("lr", 1e-3),
+        weight_decay=0.0,
+        beta1=beta1,
+        beta2=beta2,
+        eps=defaults.get("eps", 1e-8),
+        use_bfloat16_moments=use_bfloat16_moments,
+    )
+  if isinstance(optimizer, torch.optim.Adam):
+    raise ValueError(
+        "SingleTraceTrainer does not support torch.optim.Adam with"
+        f" weight_decay={defaults.get('weight_decay')!r} (expected 0.0 or"
+        " AdamW with decoupled weight decay)"
+    )
+  raise ValueError(
+      "Unsupported torch optimizer for SingleTraceTrainer:"
+      f" {type(optimizer).__name__} (expected AdamW, SGD, or Adam with"
+      " weight_decay=0.0)"
   )
+
+
+def _single_trace_real_loss(model, args, kwargs) -> torch.Tensor:
+  """Computes loss like `real_loss`, falling back to `logits.mean()`."""
+  out = model(*args, **kwargs)
+  if (
+      getattr(out, "loss", None) is None
+      and not (isinstance(out, dict) and out.get("loss") is not None)
+      and getattr(out, "sample", None) is None
+      and not (isinstance(out, dict) and out.get("sample") is not None)
+  ):
+    if getattr(out, "logits", None) is not None:
+      return out.logits.mean()
+    if isinstance(out, dict) and out.get("logits") is not None:
+      return out["logits"].mean()
+  return loss_lib.real_loss(lambda *_a, **_kw: out, args, kwargs)
 
 
 class SingleTraceTrainingStepper(common.BaseStepper):
@@ -130,10 +182,23 @@ class SingleTraceTrainingStepper(common.BaseStepper):
     self._input_args = input_args
     self._input_kwargs = input_kwargs
     self._step_fn = None
-    first_param = next(self._model.parameters(), None)
-    use_bfloat16_moments = (
-        first_param is not None and first_param.dtype == torch.bfloat16
+    params = list(self._model.parameters())
+    use_bfloat16_moments = bool(params) and all(
+        p.dtype == torch.bfloat16 for p in params
     )
+    base_loss_fn = (
+        _single_trace_real_loss
+        if self._compute_loss is loss_lib.real_loss
+        else self._compute_loss
+    )
+    if self._input_args and self._input_kwargs:
+      compute_loss = base_loss_fn
+
+      def compute_loss_fn(m, a, _kw):
+        return compute_loss(m, a[0], a[1])
+
+    else:
+      compute_loss_fn = base_loss_fn
     self._trainer = single_trace_trainer_adapter.SingleTraceTrainerAdapter(
         model=self._model,
         optimizer=_to_single_trace_optimizer(
@@ -143,11 +208,7 @@ class SingleTraceTrainingStepper(common.BaseStepper):
         # same loss when `real_loss` succeeds, and the built-in loss falls back
         # to averaging `logits` or the first output tensor where `real_loss`
         # raises.
-        compute_loss_fn=(
-            None
-            if self._compute_loss is loss_lib.real_loss
-            else self._compute_loss
-        ),
+        compute_loss_fn=compute_loss_fn,
     )
 
   def compile(self, compile_config, target):
@@ -169,7 +230,12 @@ class SingleTraceTrainingStepper(common.BaseStepper):
   def get_step_fn(self):
     assert self._trainer is not None
     if self._step_fn is None:
-      inputs = self._input_kwargs if self._input_kwargs else self._input_args
+      if self._input_args and self._input_kwargs:
+        inputs = (self._input_args, self._input_kwargs)
+      elif self._input_kwargs:
+        inputs = self._input_kwargs
+      else:
+        inputs = self._input_args
       step_fn = self._trainer.make_compiled_train_step(example_inputs=inputs)
       self._step_fn = functools.partial(self._step_function, step_fn, inputs)
     return self._step_fn
@@ -213,13 +279,17 @@ class TrainingStepper:
         self._use_single_trace
         and target.device_kind == target_lib.DeviceKind.TPU
     ):
-      self._single_trace_stepper = SingleTraceTrainingStepper(
-          accum_steps=self._accum_steps, compute_loss=self._compute_loss
-      )
-      self._single_trace_stepper.init_with_benchmark_args(
-          *self._init_args, **self._init_kwargs
-      )
-      self._single_trace_stepper.compile(compile_config, target)
+      try:
+        single_trace_stepper = SingleTraceTrainingStepper(
+            accum_steps=self._accum_steps, compute_loss=self._compute_loss
+        )
+        single_trace_stepper.init_with_benchmark_args(
+            *self._init_args, **self._init_kwargs
+        )
+        single_trace_stepper.compile(compile_config, target)
+        self._single_trace_stepper = single_trace_stepper
+      except Exception as e:  # pylint: disable=broad-except
+        self._fall_back_to_standard(e)
     else:
       self._standard_stepper.compile(compile_config, target)
 

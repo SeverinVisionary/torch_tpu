@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import MutableMapping
 import functools
 from typing import Any
 
@@ -19,6 +20,31 @@ import torch
 from perflab import context as context_lib
 from perflab import model_helpers
 from perflab import torch_device_ops
+
+
+def _set_config_dtype(config: Any, dtype: torch.dtype) -> None:
+  """Sets both `dtype` and `torch_dtype` on `config` and nested sub-configs."""
+  if config is None:
+    return
+  if isinstance(config, MutableMapping):
+    config["dtype"] = dtype
+    config["torch_dtype"] = dtype
+    sub_configs = (
+        config.get("text_config"),
+        config.get("vision_config"),
+        config.get("thinker_config"),
+    )
+  else:
+    config.dtype = dtype
+    config.torch_dtype = dtype
+    sub_configs = (
+        getattr(config, "text_config", None),
+        getattr(config, "vision_config", None),
+        getattr(config, "thinker_config", None),
+    )
+  for sub_cfg in sub_configs:
+    if sub_cfg is not None:
+      _set_config_dtype(sub_cfg, dtype)
 
 
 def _run_blip_forward_on_model_device(model: torch.nn.Module) -> None:
@@ -70,8 +96,10 @@ def default_load_model(
     seq_len = 2048
 
   registry = model_helpers.get_module_registry()
+  dtype = torch_device_ops.get_torch_dtype(ctx.dtype)
 
-  def modify_config_hook(config):
+  def modify_config_hook(config: Any) -> Any:
+    _set_config_dtype(config, dtype)
     # Time series models such as TimesFM pad or truncate every series to
     # `context_length` rather than taking the length of the generated inputs.
     # Cap it so that they run on seq_len steps like the other benchmarks.
@@ -115,7 +143,6 @@ def default_load_model(
       modify_config_hook=modify_config_hook,
   )
 
-  dtype = torch_device_ops.get_torch_dtype(ctx.dtype)
   device_str = ctx.device_kind.value
   with torch.device(device_str):
     model = module_spec.module_factory().to(dtype=dtype)

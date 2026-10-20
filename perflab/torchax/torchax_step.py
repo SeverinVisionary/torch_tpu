@@ -129,6 +129,8 @@ def _extract_jax_compatible_output(out: Any) -> Any:
     return _extract_jax_compatible_output(out.loss)
   if hasattr(out, "logits") and out.logits is not None:
     return _extract_jax_compatible_output(out.logits)
+  if hasattr(out, "sample") and out.sample is not None:
+    return _extract_jax_compatible_output(out.sample)
   if hasattr(out, "to_tuple"):
     res = tuple(
         _extract_jax_compatible_output(x)
@@ -173,8 +175,12 @@ def _default_loss_fn(outputs: Any) -> torch.Tensor:
   """Top-level default loss evaluator for training step function."""
   if hasattr(outputs, "loss") and outputs.loss is not None:
     loss = outputs.loss
-  elif isinstance(outputs, dict) and "loss" in outputs:
+  elif isinstance(outputs, dict) and outputs.get("loss") is not None:
     loss = outputs["loss"]
+  elif hasattr(outputs, "sample") and outputs.sample is not None:
+    loss = outputs.sample
+  elif isinstance(outputs, dict) and outputs.get("sample") is not None:
+    loss = outputs["sample"]
   elif (
       isinstance(outputs, (list, tuple))
       and outputs
@@ -362,9 +368,10 @@ class TorchaxForwardStepper(_BaseTorchaxStepper):
 
     def step_fn(weights, buffers, input_tensors):
       step_args, step_kwargs = self._reconstruct_inputs(input_tensors)
-      return _call_functional_model(
-          model_jittable, weights, buffers, step_args, step_kwargs
-      )
+      with torch.no_grad():
+        return _call_functional_model(
+            model_jittable, weights, buffers, step_args, step_kwargs
+        )
 
     self._runnable_step = step_fn
 
