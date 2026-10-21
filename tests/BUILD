@@ -450,6 +450,7 @@ torch_tpu_py_library(
     data = ["goldens.pin"],
     visibility = ["//:__subpackages__"],
     deps = [
+        ":accuracy_overrides",
         ":dynamism_test_utils",
         ":quantize_utils",
         ":seed_test_utils",
@@ -465,6 +466,17 @@ torch_tpu_py_library(
         "//src/torch_tpu/_internal/utils",
         "//src/torch_tpu/_internal/utils:test_utils",
         "@pypi//pyyaml",
+    ],
+)
+
+torch_tpu_py_library(
+    name = "accuracy_overrides",
+    testonly = True,
+    srcs = ["accuracy_overrides.py"],
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//shims/torch:pytorch",
+        "//src/torch_tpu/_internal/utils:test_utils",
     ],
 )
 
@@ -539,6 +551,7 @@ torch_tpu_py_test(
         "ops-test",  # Heavy ops test: see run_bazel_diff.py for details.
     ] + _OSS_GOLDEN_TAGS,
     deps = [
+        ":accuracy_overrides",
         ":dynamism_test_utils",
         ":op_testing",
         ":quantize_utils",
@@ -578,6 +591,7 @@ torch_tpu_py_test(
         "ops-test",  # Heavy ops test: see run_bazel_diff.py for details.
     ] + _OSS_GOLDEN_TAGS,
     deps = [
+        ":accuracy_overrides",
         ":dynamism_test_utils",
         ":op_testing",
         ":quantize_utils",
@@ -617,6 +631,7 @@ torch_tpu_py_test(
         "ops-test",  # Heavy ops test: see run_bazel_diff.py for details.
     ] + _OSS_GOLDEN_TAGS,
     deps = [
+        ":accuracy_overrides",
         ":dynamism_test_utils",
         ":op_testing",
         ":quantize_utils",
@@ -655,6 +670,7 @@ torch_tpu_py_test(
         "ops-test",  # Heavy ops test: see run_bazel_diff.py for details.
     ] + _OSS_GOLDEN_TAGS,
     deps = [
+        ":accuracy_overrides",
         ":dynamism_test_utils",
         ":op_testing",
         ":quantize_utils",
@@ -693,6 +709,7 @@ torch_tpu_py_test(
         "ops-test",  # Heavy ops test: see run_bazel_diff.py for details.
     ] + _OSS_GOLDEN_TAGS,
     deps = [
+        ":accuracy_overrides",
         ":dynamism_test_utils",
         ":op_testing",
         ":quantize_utils",
@@ -733,6 +750,7 @@ torch_tpu_py_test(
         "ops-test",  # Heavy ops test: see run_bazel_diff.py for details.
     ] + _OSS_GOLDEN_TAGS,
     deps = [
+        ":accuracy_overrides",
         ":dynamism_test_utils",
         ":op_testing",
         ":quantize_utils",
@@ -773,6 +791,7 @@ torch_tpu_py_test(
         "ops-test",  # Heavy ops test: see run_bazel_diff.py for details.
     ] + _OSS_GOLDEN_TAGS,
     deps = [
+        ":accuracy_overrides",
         ":dynamism_test_utils",
         ":op_testing",
         ":quantize_utils",
@@ -809,6 +828,7 @@ torch_tpu_py_test(
         "ops-test",  # Heavy ops test: see run_bazel_diff.py for details.
     ] + _OSS_GOLDEN_TAGS,
     deps = [
+        ":accuracy_overrides",
         ":dynamism_test_utils",
         ":op_testing",
         ":quantize_utils",
@@ -849,6 +869,7 @@ torch_tpu_py_test(
         "ops-test",  # Heavy ops test: see run_bazel_diff.py for details.
     ] + _OSS_GOLDEN_TAGS,
     deps = [
+        ":accuracy_overrides",
         ":dynamism_test_utils",
         ":op_testing",
         ":quantize_utils",
@@ -898,6 +919,7 @@ torch_tpu_py_test(
         "requires-tpu-v5lite",
     ],
     deps = [
+        ":accuracy_overrides",
         ":dynamism_test_utils",
         ":op_testing",
         ":quantize_utils",
@@ -932,6 +954,7 @@ torch_tpu_py_test(
         "ops-test",  # Heavy ops test: see run_bazel_diff.py for details.
     ] + _OSS_GOLDEN_TAGS,
     deps = [
+        ":accuracy_overrides",
         ":dynamism_test_utils",
         ":op_testing",
         ":quantize_utils",
@@ -968,6 +991,7 @@ torch_tpu_py_test(
         "ops-test",  # Heavy ops test: see run_bazel_diff.py for details.
     ] + _OSS_GOLDEN_TAGS,
     deps = [
+        ":accuracy_overrides",
         ":dynamism_test_utils",
         ":op_testing",
         ":quantize_utils",
@@ -1004,6 +1028,7 @@ torch_tpu_py_test(
     # ops_test_vs_gpu target.
     shard_count = 3,
     deps = [
+        ":accuracy_overrides",
         ":dynamism_test_utils",
         ":op_testing",
         ":quantize_utils",
@@ -1032,6 +1057,7 @@ torch_tpu_py_test(
     platform = _GPU_GOLDEN_PLATFORM,
     shard_count = 3,
     deps = [
+        ":accuracy_overrides",
         ":dynamism_test_utils",
         ":op_testing",
         ":quantize_utils",
@@ -1057,6 +1083,7 @@ torch_tpu_py_test(
     shard_count = 1,
     tags = [_GPU_GOLDEN_TAG_SM90],
     deps = [
+        ":accuracy_overrides",
         ":dynamism_test_utils",
         ":op_testing",
         ":quantize_utils",
@@ -1085,6 +1112,7 @@ torch_tpu_py_test(
     platform = _GPU_GOLDEN_PLATFORM,
     shard_count = 3,
     deps = [
+        ":accuracy_overrides",
         ":dynamism_test_utils",
         ":op_testing",
         ":quantize_utils",
@@ -1106,6 +1134,7 @@ torch_tpu_py_test(
     # per-process global, so a sharded run would dump partial results.
     shard_count = 1,
     deps = [
+        ":accuracy_overrides",
         ":dynamism_test_utils",
         ":op_testing",
         ":quantize_utils",
@@ -1198,6 +1227,7 @@ torch_tpu_py_test(
     platform = _GPU_GOLDEN_PLATFORM,
     shard_count = 3,
     deps = [
+        ":accuracy_overrides",
         ":dynamism_test_utils",
         ":op_testing",
         ":quantize_utils",
@@ -1222,6 +1252,7 @@ torch_tpu_py_test(
     shard_count = 1,
     tags = [_GPU_GOLDEN_TAG_SM90],
     deps = [
+        ":accuracy_overrides",
         ":dynamism_test_utils",
         ":op_testing",
         ":quantize_utils",
@@ -1247,6 +1278,7 @@ torch_tpu_py_test(
     shard_count = 1,
     tags = [_GPU_GOLDEN_TAG_SM90],
     deps = [
+        ":accuracy_overrides",
         ":dynamism_test_utils",
         ":op_testing",
         ":quantize_utils",
