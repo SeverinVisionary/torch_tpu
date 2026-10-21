@@ -37,7 +37,7 @@ import sys
 import time
 import traceback
 import typing
-from typing import Any, Final, TypeGuard
+from typing import Any, Final
 import unittest
 
 from absl import flags
@@ -3532,7 +3532,7 @@ def _sample_inputs(
       samples = [_convert_sample_dtype(s, sample_dtype, dtype) for s in samples]
     return samples
   except Exception as e:  # pylint: disable=broad-except
-    if device.type == "cpu" or not _gen_gpu_golden_mode():
+    if device.type == "cpu":
       raise
 
     # CUDA kernels have gaps in supporting certain dtypes, especially the
@@ -4245,7 +4245,7 @@ def print_reproducer(
   print(fx_reproducer, flush=True)
 
 
-def _run_and_print_exception(func: Callable[[], None]) -> None:
+def _run_and_print_exception(func: Callable[[], Any]) -> None:
   """Runs func() and prints the exception if one is raised."""
   try:
     func()
@@ -4383,6 +4383,203 @@ def _compiled_supports_op(
   if variant == OpVariant.OUT:
     key += ".out"
   return key not in compiled_deny_list
+
+
+def _target_device(dtype: torch.dtype, device: torch.device) -> torch.device:
+  """Returns the device to actually run an op with `dtype` inputs on.
+
+  Args:
+    dtype: The dtype of the op's inputs.
+    device: The device requested for running the op.
+
+  Returns:
+    `device`, unless `device` is a CUDA device and `dtype` is a sub-byte dtype
+    (see `quantize_utils.SUB_BYTE_DTYPES`), in which case the CPU device is
+    returned instead. This only happens when generating GPU goldens, which is
+    the only mode that runs ops on CUDA.
+  """
+  if dtype in quantize_utils.SUB_BYTE_DTYPES and device.type == "cuda":
+    # Sub-byte dtypes do not have CUDA copy or cast kernels. Invoking an
+    # operator or .to("cuda") on a sub-byte tensor causes a CUDA assertion
+    # failure, putting CUDA context into an unrecoverable error state.
+    return torch.device("cpu")
+  return device
+
+
+def _op_func(
+    op: OpInfo, variant: OpVariant, target_device: torch.device
+) -> Callable[..., Any]:
+  """Returns the function to call for running `variant` of `op`."""
+  # For operators that lack a native PyTorch CPU kernel (e.g. internal CUDA
+  # ops like _thnn_fused_lstm_cell / _thnn_fused_gru_cell), invoke the custom
+  # analytical reference function `.ref` when computing CPU golden results,
+  # i.e. for sub-byte dtypes in the gen_gpu_golden mode.
+  ref = getattr(op, "ref", None)
+  if (
+      target_device.type == "cpu"
+      and ref is not None
+      and (
+          op.name.startswith("_thnn_fused_")
+          or getattr(op, "use_ref_for_cpu_golden", False)
+      )
+  ):
+    return ref
+  return op.inplace_variant if variant == OpVariant.INPLACE else op
+
+
+def _requires_grad_input(input_value: _pytree.PyTree) -> _pytree.PyTree:
+  """Sets requires_grad=True for the non-empty float/complex input tensors."""
+
+  def set_requires_grad(t: Any) -> Any:
+    if (
+        isinstance(t, torch.Tensor)
+        and (t.is_floating_point() or t.is_complex())
+        and t.numel() > 0
+    ):
+      return t.requires_grad_(True)
+    return t
+
+  return _tensor_tree_map(set_requires_grad, input_value)
+
+
+def _can_compute_grad(variant: OpVariant, input_value: _pytree.PyTree) -> bool:
+  """Returns whether the gradient w.r.t. `input_value` can be computed."""
+
+  def is_differentiable(t: Any) -> bool:
+    return isinstance(t, torch.Tensor) and t.requires_grad and t.numel() > 0
+
+  # Autograd doesn't work with inplace ops and out variants, as they
+  # erase the input tensor.
+  if (
+      variant == OpVariant.INPLACE
+      or variant == OpVariant.OUT
+      or not any(
+          _pytree.tree_leaves(_tensor_tree_map(is_differentiable, input_value))
+      )
+  ):
+    return False
+
+  # TODO: fix the bug where computing the gradient of a 0-sized input tensor
+  # fails with an exception "Function SumBackward0 returned an invalid
+  # gradient at index 0 - expected device tpu:0 but got cpu".
+  if isinstance(input_value, torch.Tensor) and input_value.numel() == 0:
+    return False
+  return True
+
+
+def _compute_grad(
+    result: Any, input_value: _pytree.PyTree, device: torch.device
+) -> Any:
+  """Returns the gradient of the sum of `result` w.r.t. `input_value`."""
+  losses = [
+      t.sum()
+      for t in _pytree.tree_leaves(result)
+      if isinstance(t, torch.Tensor)
+      and (t.is_floating_point() or t.is_complex())
+      and t.numel() > 0
+  ]
+  if not losses:
+    return _dummy_grad(device)
+
+  torch.sum(torch.stack(losses)).backward()
+
+  def get_grad(t: Any) -> torch.Tensor | None:
+    if isinstance(t, torch.Tensor) and t.grad is not None:
+      return t.grad.clone()
+    return None
+
+  return _tensor_tree_map(get_grad, input_value)
+
+
+def _dtypes_to_test_for_op(
+    op: OpInfo, recording: bool
+) -> Sequence[torch.dtype]:
+  """Returns the candidate input dtypes to test `op` with."""
+  dtypes_to_test = list(UNQUANTIZED_NUMERIC_DTYPES)
+  if recording:
+    # Include quantized numeric dtypes during GPU golden data generation.
+    dtypes_to_test.extend(quantize_utils.QUANTIZED_NUMERIC_DTYPES)
+  else:
+    # When reading GPU goldens, include quantized numeric dtypes if the op
+    # explicitly declares support for them in its OpInfo.
+    dtypes_to_test.extend([
+        d
+        for d in getattr(op, "dtypes", ())
+        if d in quantize_utils.QUANTIZED_NUMERIC_DTYPES
+    ])
+  return list(dict.fromkeys(dtypes_to_test))
+
+
+def _out_casting_tests(
+    op: OpInfo,
+    dtypes_to_test: Iterable[torch.dtype],
+    *,
+    exclude_dtypes: Sequence[torch.dtype],
+    check_op_failures: bool,
+    compute_grad: bool,
+    use_compiled: bool,
+    recording: bool,
+) -> Mapping[torch.dtype, Sequence[tuple[torch.dtype, bool]]]:
+  """Returns the out-variant dtype casting tests to run for each input dtype.
+
+  Args:
+    op: The op to test.
+    dtypes_to_test: The candidate input dtypes.
+    exclude_dtypes: The input dtypes excluded by the test.
+    check_op_failures: Whether to check op failures for the allowed cast.
+    compute_grad: Whether the test computes gradients.
+    use_compiled: Whether the test compiles the op.
+    recording: Whether the test records GPU goldens.
+
+  Returns:
+    A mapping from an input dtype to `(out_dtype_override, check_op_failures)`
+    pairs, each describing an additional out-variant test to run.
+  """
+  # Out-variant casting tests exception parity and type promotion in
+  # forward evaluations and is not applicable when computing gradients.
+  if compute_grad:
+    return {}
+  # In golden generation mode, always capture golden data regardless of
+  # whether the op is known to fail on TPU.
+  if not recording and (
+      op.name in _OUT_DTYPE_CAST_KNOWN_FAILURES
+      or (use_compiled and op.name in _COMPILED_OUT_DTYPE_CAST_KNOWN_FAILURES)
+  ):
+    return {}
+
+  # Select one valid promotional upcast pair (allowed_pair, e.g., float32
+  # -> float64) and one invalid downcast pair (illegal_pair, e.g.,
+  # float32 -> int32) from the dtypes to be tested. These will be used
+  # below to test out-variant dtype casting and exception parity between
+  # TorchTPU and GPU.
+  cast_pairs = find_cast_pairs([
+      d
+      for d in dtypes_to_test
+      if not _should_skip_dtype(d, exclude_dtypes=exclude_dtypes)
+  ])
+  tests = collections.defaultdict(list)
+  # For the input dtype of the allowed cast pair, run an additional
+  # out-variant test with out_dtype_override set to the target upcast dtype to
+  # verify that TorchTPU correctly supports out-variant promotional upcasting.
+  if cast_pairs.allowed_pair is not None:
+    src, dst = cast_pairs.allowed_pair
+    tests[src].append((dst, check_op_failures))
+  # For the input dtype of the illegal cast pair, run an additional out-variant
+  # test with out_dtype_override set to the target downcast dtype to verify
+  # that TorchTPU raises the same RuntimeError (exception parity) as
+  # PyTorch/GPU.
+  if cast_pairs.illegal_pair is not None:
+    src, dst = cast_pairs.illegal_pair
+    tests[src].append((dst, True))
+  return tests
+
+
+# How `do_test_op` logs the start of testing each op variant.
+_VARIANT_CALL_FORMAT: Final[Mapping[OpVariant, str]] = {
+    OpVariant.BASE: "{}()",
+    OpVariant.OUT: "{}(out=...)",
+    OpVariant.INPLACE: "{}_()",
+}
 
 
 class TorchTpuTestBase(seed_test_utils.RepeatableTest, common_utils.TestCase):
@@ -4710,36 +4907,64 @@ class OpInfoTestBase(TorchTpuTestBase):
           flush=True,
       )
 
-    if not _gen_gpu_golden_mode():
-      samples = _GOLDEN_GPU_DATA.get_samples(
-          self._testMethodName,
-          variant,
-          dtype,
-          out_dtype_override=out_dtype_override,
-      )
-      # TODO(b/540887166): Enable this check for compiled mode too when the bug
-      # is fixed.
-      if not samples and not is_compiled_mode():
-        self.fail(
-            f"No GPU golden samples found for {op_name}() with dtype {dtype}."
-            " Please re-generate the GPU golden files to cover"
-            " the new (op, dtype)."
-        )
-      if max_samples is None:
-        max_samples = _MAX_SAMPLES_PER_OP_DTYPE.value
-      if max_samples >= 0 and len(samples) > max_samples:
-        print(
-            f">>> Taking {max_samples} samples from "
-            f" {len(samples)} test samples ...",
-            flush=True,
-        )
-        samples = samples[:max_samples]
-      return samples
-
-    # Generate sample inputs on the golden device.
-    golden_samples = _sample_inputs(op, self.golden_device, dtype)
     if max_samples is None:
       max_samples = _MAX_SAMPLES_PER_OP_DTYPE.value
+    if _gen_gpu_golden_mode():
+      return self._generate_golden_pairs(
+          op,
+          dtype,
+          variant,
+          max_samples,
+          compute_grad=compute_grad,
+          use_compiled=use_compiled,
+          out_dtype_override=out_dtype_override,
+      )
+    return self._read_golden_pairs(
+        op, dtype, variant, max_samples, out_dtype_override
+    )
+
+  def _read_golden_pairs(
+      self,
+      op: OpInfo,
+      dtype: torch.dtype,
+      variant: OpVariant,
+      max_samples: int,
+      out_dtype_override: torch.dtype | None,
+  ) -> Sequence[tuple[OpInput, OpOutput]]:
+    """Returns up to `max_samples` recorded GPU golden pairs for the op."""
+    samples = _GOLDEN_GPU_DATA.get_samples(
+        self._testMethodName,
+        variant,
+        dtype,
+        out_dtype_override=out_dtype_override,
+    )
+    # TODO(b/540887166): Enable this check for compiled mode too when the bug
+    # is fixed.
+    if not samples and not is_compiled_mode():
+      self.fail(
+          "No GPU golden samples found for"
+          f" {_op_name_for_logging(op, variant)}() with dtype {dtype}. Please"
+          " re-generate the GPU golden files to cover the new (op, dtype)."
+      )
+    if max_samples >= 0 and len(samples) > max_samples:
+      print(
+          f">>> Taking {max_samples} samples from "
+          f" {len(samples)} test samples ...",
+          flush=True,
+      )
+      samples = samples[:max_samples]
+    return samples
+
+  def _generate_golden_pairs(
+      self,
+      op: OpInfo,
+      dtype: torch.dtype,
+      variant: OpVariant,
+      max_samples: int,
+      **run_op_kwargs: Any,
+  ) -> Sequence[tuple[OpInput, OpOutput]]:
+    """Generates up to `max_samples` golden pairs on the golden device."""
+    golden_samples = _sample_inputs(op, self.golden_device, dtype)
     if max_samples >= 0 and len(golden_samples) > max_samples:
       print(
           f">>> Taking {max_samples} random samples from "
@@ -4763,8 +4988,6 @@ class OpInfoTestBase(TorchTpuTestBase):
           variant=variant,
           dtype=dtype,
           op_input=golden_input,
-          compute_grad=compute_grad,
-          use_compiled=use_compiled,
           device=self.golden_device,
           subtest_name="golden",
           # When generating golden results, we should trust the op's output
@@ -4774,18 +4997,9 @@ class OpInfoTestBase(TorchTpuTestBase):
           check_device=False,
           # No need to mark inputs as dynamic when computing golden results.
           check_dynamism=False,
-          out_dtype_override=out_dtype_override,
+          **run_op_kwargs,
       )
-      golden_output = OpOutput(golden_result)
-      pairs.append((golden_input, golden_output))
-      _GOLDEN_GPU_DATA.add(
-          self._testMethodName,
-          variant,
-          dtype,
-          golden_input,
-          golden_output,
-          out_dtype_override=out_dtype_override,
-      )
+      pairs.append((golden_input, OpOutput(golden_result)))
     return pairs
 
   def _run_op(
@@ -4802,7 +5016,7 @@ class OpInfoTestBase(TorchTpuTestBase):
       out: Any = None,
       compute_grad: bool = False,
       use_compiled: bool = False,
-      measure_perf: bool = True,
+      measure_perf: bool = False,
       out_dtype_override: torch.dtype | None = None,
   ) -> Any:
     """Run the op on the given device.
@@ -4829,7 +5043,7 @@ class OpInfoTestBase(TorchTpuTestBase):
       compute_grad: If True, compute the gradient of the op with respect to the
         input instead of the op outputs.
       use_compiled: If True, use torch.compile to compile the op before running.
-      measure_perf: If True, measure the performance of the op in the perf mode.
+      measure_perf: If True, measure the performance of the op.
       out_dtype_override: The data type of the out tensor to use when testing
         out-variant dtype casting.
 
@@ -4847,167 +5061,62 @@ class OpInfoTestBase(TorchTpuTestBase):
       ), f"out must be None when testing the {variant} variant of an op."
 
     op_name = _op_name_for_logging(op, variant)
-    target_device = device
-    if (
-        _gen_gpu_golden_mode()
-        and dtype in quantize_utils.SUB_BYTE_DTYPES
-        and device.type == "cuda"
-    ):
-      # Sub-byte dtypes do not have CUDA copy or cast kernels. Invoking an
-      # operator or .to("cuda") on a sub-byte tensor causes a CUDA assertion
-      # failure, putting CUDA context into an unrecoverable error state.
-      target_device = torch.device("cpu")
-
+    target_device = _target_device(dtype, device)
     if variant == OpVariant.OUT and out is None:
-      # We must construct the out argument container ourselves.
-      #
-      # First, execute the base variant to dynamically determine the output
-      # PyTree structure (e.g., single tensor vs. tuple of tensors) and natural
-      # dtypes (e.g., bool for comparison ops or int64 for auxiliary index
-      # outputs).
-      base_result = self._run_op(
-          op=op,
-          variant=OpVariant.BASE,
-          dtype=dtype,
-          op_input=op_input,
-          compute_grad=False,
-          use_compiled=use_compiled,
-          device=device,
+      out = self._prepare_out(
+          op,
+          dtype,
+          op_input,
+          device,
           subtest_name=subtest_name,
           check_device=check_device,
           check_dynamism=check_dynamism,
-          # This _run_op() call is for preparing test data, not part of the test
-          # itself, so disable performance measurement to avoid skewing metrics.
-          measure_perf=False,
+          use_compiled=use_compiled,
+          out_dtype_override=out_dtype_override,
       )
-      if isinstance(base_result, Exception):
-        return base_result
-      # Next, generate zero-element out tensors (shape (0,)) matching the
-      # discovered structure to verify out-variant shape resizing compliance.
-      out = to(
-          _prepare_zero_element_out_tensors(
-              base_result,
-              out_dtype_override=out_dtype_override,
-          ),
-          target_device,
-      )
+      if isinstance(out, Exception):
+        return out
 
-    op_func = op.inplace_variant if variant == OpVariant.INPLACE else op
-    # For operators that lack a native PyTorch CPU kernel (e.g. internal CUDA
-    # ops like _thnn_fused_lstm_cell / _thnn_fused_gru_cell), invoke the custom
-    # analytical reference function `.ref` when computing CPU golden results,
-    # i.e. for sub-byte dtypes in the gen_gpu_golden mode.
-    if (
-        target_device.type == "cpu"
-        and getattr(op, "ref", None) is not None
-        and (
-            op.name.startswith("_thnn_fused_")
-            or getattr(op, "use_ref_for_cpu_golden", False)
-        )
-    ):
-      op_func = op.ref
+    op_func = _op_func(op, variant, target_device)
 
     # Clone the sample to prevent the op from mutating it.
     # We must deepcopy op_input *before* setting its device to the given device,
     # because deepcopying a TPU tensor is not implemented yet.
     device_op_input = to(copy.deepcopy(op_input), target_device)
-
     if variant == OpVariant.OUT:
       device_op_input.kwargs["out"] = out
-
-    input_value = device_op_input.input_value
 
     is_dynamic_test = bool(
         _CHECK_DYNAMISM_USING_SEED.value and device == torch.device("tpu")
     )
-
     if is_dynamic_test:
-      if not check_dynamism:
-        self.skipTest(f"Dynamism check is explicitly disabled for {op_name}.")
-
-      dynamism_mode = (
-          DynamismMode.COMPILE if use_compiled else DynamismMode.EAGER
-      )
-      print(
-          f">>> Marking dynamism for {op_name} with dtype {dtype}"
-          f" (mode={dynamism_mode.value}) ...",
-          flush=True,
-      )
-
-      # Verify op is supported with dynamism.
-      skip = self.dynamism_filter_fn(
-          op, op_input.input_value, op_input.args, mode=dynamism_mode
-      )
-      if skip is not None:
-        self.skipTest(skip)
-
-      # Use a seed value to enable reproducing a failure deterministically.
-      seed = _CHECK_DYNAMISM_USING_SEED.value
-      seed = seed if seed > 0 else (time.time_ns() % 100000)
-      print(f">>>> Reproduce using `--check_dynamism_using_seed={seed}`")
-      self.dynamism_mark_dynamic_fn(
-          seed,
+      self._mark_dynamic(
           op,
-          device_op_input.input_value,
-          device_op_input.args,
-          mode=dynamism_mode,
-          kwargs=device_op_input.kwargs,
+          variant,
+          dtype,
+          op_input,
+          device_op_input,
+          check_dynamism=check_dynamism,
+          use_compiled=use_compiled,
       )
-
     if use_compiled:
-      if not _compiled_supports_op(op, device_op_input, variant):
-        self.skipTest(f"TpuBackend does not support {op_name} currently.")
-      logging.getLogger(tt_compile.TpuBackend.__module__).setLevel(
-          logging.DEBUG
+      op_func = self._compile(
+          op_func,
+          op,
+          variant,
+          device,
+          device_op_input,
+          is_dynamic_test=is_dynamic_test,
       )
-      backend = "tpu" if str(device) == "tpu" else "inductor"
-      print(f"Compiling {op_name} for device {device} ...", flush=True)
-      if is_dynamic_test:
-        # Reset Dynamo state so dimensions marked dynamic in earlier subtests
-        # do not carry over across compilations.
-        torch._dynamo.reset()  # pylint: disable=protected-access
-        op_func = torch.compile(op_func, backend=backend)
-      else:
-        op_func = torch.compile(op_func, dynamic=False, backend=backend)
-
     if compute_grad:
-
-      def set_requires_grad(t: Any) -> Any:
-        if (
-            isinstance(t, torch.Tensor)
-            and (t.is_floating_point() or t.is_complex())
-            and t.numel() > 0
-        ):
-          return t.requires_grad_(True)
-        return t
-
-      # Set requires_grad=True for all floating-point and complex tensors in
-      # the input. We only support testing gradients when input_value is a
-      # tensor or a (possibly nested) list/tuple of tensors.
-      input_value = _tensor_tree_map(set_requires_grad, input_value)
-      device_op_input.input_value = input_value
-
-      def is_differentiable(t: Any) -> bool:
-        return isinstance(t, torch.Tensor) and t.requires_grad and t.numel() > 0
-
-      # Autograd doesn't work with inplace ops and out variants, as they
-      # erase the input tensor.
-      if (
-          variant == OpVariant.INPLACE
-          or variant == OpVariant.OUT
-          or not any(
-              _pytree.tree_leaves(
-                  _tensor_tree_map(is_differentiable, input_value)
-              )
-          )
-      ):
+      # We only support testing gradients when input_value is a tensor or a
+      # (possibly nested) list/tuple of tensors.
+      device_op_input.input_value = _requires_grad_input(
+          device_op_input.input_value
+      )
+      if not _can_compute_grad(variant, device_op_input.input_value):
         return _dummy_grad(device)
-
-      # TODO: fix the bug where computing the gradient of a 0-sized input tensor
-      # fails with an exception "Function SumBackward0 returned an invalid
-      # gradient at index 0 - expected device tpu:0 but got cpu".
-      if isinstance(input_value, torch.Tensor) and input_value.numel() == 0:
-        return _dummy_grad(device)
+    input_value = device_op_input.input_value
 
     try:
       start_time = time.perf_counter()
@@ -5025,39 +5134,10 @@ class OpInfoTestBase(TorchTpuTestBase):
         result = out
 
       if compute_grad:
-        losses = [
-            t.sum()
-            for t in _pytree.tree_leaves(result)
-            if isinstance(t, torch.Tensor)
-            and (t.is_floating_point() or t.is_complex())
-            and t.numel() > 0
-        ]
-
-        if losses:
-          torch.sum(torch.stack(losses)).backward()
-
-          def get_grad(t: Any) -> torch.Tensor | None:
-            if isinstance(t, torch.Tensor) and t.grad is not None:
-              return t.grad.clone()
-            return None
-
-          result = _tensor_tree_map(get_grad, input_value)
-        else:
-          result = _dummy_grad(device)
+        result = _compute_grad(result, input_value, device)
 
       if check_device:
-        # To prevent bugs in ops and the test itself, we check that
-        # tensors in the result are indeed on the expected device.
-        def assert_on_device(obj: Any) -> None:
-          if isinstance(obj, torch.Tensor):
-            self.assert_devices_equivalent(obj.device, target_device)
-
-        try:
-          _tensor_tree_map(assert_on_device, result)
-        except AssertionError as e:
-          self.fail(
-              f"Expected result to be on {target_device}, but got {result}: {e}"
-          )
+        self._assert_on_device(result, target_device)
 
       # In the eager mode of pytorch CPU/GPU, ops are run synchronously: if
       # an op encounters an error, the op() call itself will raise an
@@ -5072,7 +5152,7 @@ class OpInfoTestBase(TorchTpuTestBase):
       # on TorchTPU. Hence the following call is is done inside _run_op(), and
       # any exception it raises is attributed to the op.
       result = to(result, "cpu")
-      if _perf_mode() and measure_perf:
+      if measure_perf:
         # We must measure the time after the .to("cpu") call because that's the
         # time when the compilation and execution of the op is guaranteed to be
         # done.
@@ -5086,13 +5166,143 @@ class OpInfoTestBase(TorchTpuTestBase):
         )
     except Exception as e:  # pylint: disable=broad-except
       # The op raised an exception.
-      if _gen_gpu_golden_mode():
+      if device.type != "tpu":
         print(
             f"Exception caught during golden generation for {op_name}: {e}",
             flush=True,
         )
       result = e
     return result
+
+  def _prepare_out(
+      self,
+      op: OpInfo,
+      dtype: torch.dtype,
+      op_input: OpInput,
+      device: torch.device,
+      *,
+      subtest_name: str,
+      check_device: bool,
+      check_dynamism: bool,
+      use_compiled: bool,
+      out_dtype_override: torch.dtype | None,
+  ) -> Any:
+    """Returns the out argument for running the out variant of the op.
+
+    Returns:
+      Zero-element tensors with the structure of the base variant's result, on
+      the device to run the op on; or the Exception thrown by the base variant.
+    """
+    # First, execute the base variant to dynamically determine the output
+    # PyTree structure (e.g., single tensor vs. tuple of tensors) and natural
+    # dtypes (e.g., bool for comparison ops or int64 for auxiliary index
+    # outputs).
+    base_result = self._run_op(
+        op=op,
+        variant=OpVariant.BASE,
+        dtype=dtype,
+        op_input=op_input,
+        compute_grad=False,
+        use_compiled=use_compiled,
+        device=device,
+        subtest_name=subtest_name,
+        check_device=check_device,
+        check_dynamism=check_dynamism,
+        # This _run_op() call is for preparing test data, not part of the test
+        # itself, so don't measure its performance to avoid skewing metrics.
+    )
+    if isinstance(base_result, Exception):
+      return base_result
+    # Next, generate zero-element out tensors (shape (0,)) matching the
+    # discovered structure to verify out-variant shape resizing compliance.
+    return to(
+        _prepare_zero_element_out_tensors(
+            base_result,
+            out_dtype_override=out_dtype_override,
+        ),
+        _target_device(dtype, device),
+    )
+
+  def _mark_dynamic(
+      self,
+      op: OpInfo,
+      variant: OpVariant,
+      dtype: torch.dtype,
+      op_input: OpInput,
+      device_op_input: OpInput,
+      *,
+      check_dynamism: bool,
+      use_compiled: bool,
+  ) -> None:
+    """Marks dimensions of `device_op_input` dynamic, or skips the test."""
+    op_name = _op_name_for_logging(op, variant)
+    if not check_dynamism:
+      self.skipTest(f"Dynamism check is explicitly disabled for {op_name}.")
+
+    dynamism_mode = DynamismMode.COMPILE if use_compiled else DynamismMode.EAGER
+    print(
+        f">>> Marking dynamism for {op_name} with dtype {dtype}"
+        f" (mode={dynamism_mode.value}) ...",
+        flush=True,
+    )
+
+    # Verify op is supported with dynamism.
+    skip = self.dynamism_filter_fn(
+        op, op_input.input_value, op_input.args, mode=dynamism_mode
+    )
+    if skip is not None:
+      self.skipTest(skip)
+
+    # Use a seed value to enable reproducing a failure deterministically.
+    seed = _CHECK_DYNAMISM_USING_SEED.value
+    seed = seed if seed > 0 else (time.time_ns() % 100000)
+    print(f">>>> Reproduce using `--check_dynamism_using_seed={seed}`")
+    self.dynamism_mark_dynamic_fn(
+        seed,
+        op,
+        device_op_input.input_value,
+        device_op_input.args,
+        mode=dynamism_mode,
+        kwargs=device_op_input.kwargs,
+    )
+
+  def _compile(
+      self,
+      op_func: Callable[..., Any],
+      op: OpInfo,
+      variant: OpVariant,
+      device: torch.device,
+      device_op_input: OpInput,
+      *,
+      is_dynamic_test: bool,
+  ) -> Callable[..., Any]:
+    """Returns `op_func` compiled for `device`, or skips the test."""
+    op_name = _op_name_for_logging(op, variant)
+    if not _compiled_supports_op(op, device_op_input, variant):
+      self.skipTest(f"TpuBackend does not support {op_name} currently.")
+    logging.getLogger(tt_compile.TpuBackend.__module__).setLevel(logging.DEBUG)
+    backend = "tpu" if str(device) == "tpu" else "inductor"
+    print(f"Compiling {op_name} for device {device} ...", flush=True)
+    if is_dynamic_test:
+      # Reset Dynamo state so dimensions marked dynamic in earlier subtests
+      # do not carry over across compilations.
+      torch._dynamo.reset()  # pylint: disable=protected-access
+      return torch.compile(op_func, backend=backend)
+    return torch.compile(op_func, dynamic=False, backend=backend)
+
+  def _assert_on_device(self, result: Any, device: torch.device) -> None:
+    """Asserts that the tensors in `result` are on `device`."""
+
+    # To prevent bugs in ops and the test itself, we check that
+    # tensors in the result are indeed on the expected device.
+    def assert_on_device(obj: Any) -> None:
+      if isinstance(obj, torch.Tensor):
+        self.assert_devices_equivalent(obj.device, device)
+
+    try:
+      _tensor_tree_map(assert_on_device, result)
+    except AssertionError as e:
+      self.fail(f"Expected result to be on {device}, but got {result}: {e}")
 
   def _assert_failure_consistency(
       self,
@@ -5245,6 +5455,41 @@ class OpInfoTestBase(TorchTpuTestBase):
           **accuracy_override,  # pyrefly: ignore[bad-argument-type]
       )
 
+  def _run_on_tpu(
+      self,
+      subtest_name: str,
+      op: OpInfo,
+      variant: OpVariant,
+      dtype: torch.dtype,
+      *,
+      golden_input: OpInput,
+      **run_op_kwargs: Any,
+  ) -> tuple[Any, OpInput]:
+    """Returns the TorchTPU result and printable input for the golden input."""
+    print(f">>>> Testing {subtest_name} ...", flush=True)
+    torch_tpu_printable_input = _to_torch_tpu_printable_input(golden_input)
+    torch_tpu_printable_input.name = subtest_name
+    if _PRINT_OP_INPUTS.value > 0:
+      # TODO b/486861095
+      if op.name != "normal":
+        print_reproducer(subtest_name, op, golden_input, variant)
+      print_op_input(torch_tpu_printable_input, data=_PRINT_OP_INPUTS.value > 1)
+
+    compiler_options = (
+        {"xla_optimization_level": _OPT_LEVEL.value} if _OPT_LEVEL.value else {}
+    )
+    with compiler.custom_compiler_options(compiler_options):
+      torch_tpu_result = self._run_op(
+          op=op,
+          variant=variant,
+          dtype=dtype,
+          op_input=golden_input,
+          device=torch.device("tpu"),
+          subtest_name=subtest_name,
+          **run_op_kwargs,
+      )
+    return torch_tpu_result, torch_tpu_printable_input
+
   def _sub_test(
       self,
       subtest_name: str,
@@ -5254,23 +5499,21 @@ class OpInfoTestBase(TorchTpuTestBase):
       *,
       golden_input: OpInput,
       golden_result: Any,
-      check_device: bool,
-      check_dynamism: bool,
       check_value: CheckValueMode | Iterable[CheckValueMode] | None,
       check_dtype: bool,
       skip_output_indices: Sequence[int],
       compute_grad: bool,
       use_compiled: bool,
-      out_dtype_override: torch.dtype | None = None,
+      **run_op_kwargs: Any,
   ) -> None:
-
+    # do_test_op() already rejects LOOSE, so this never fires today. Keep it to
+    # catch mistakes by future callers.
     if check_value == CheckValueMode.LOOSE:
       raise ValueError(
           "LOOSE mode is the default. Please omit the check_value argument."
       )
 
     op_name = _op_name_for_logging(op, variant)
-    print(f">>>> Testing {subtest_name} ...", flush=True)
     if _IGNORE_ACCURACY_OVERRIDES.value:
       accuracy_overrides = {}
     elif compute_grad:
@@ -5286,38 +5529,16 @@ class OpInfoTestBase(TorchTpuTestBase):
           dtype, {}
       )
 
-    torch_tpu_printable_input = _to_torch_tpu_printable_input(golden_input)
-    torch_tpu_printable_input.name = subtest_name
-    if _PRINT_OP_INPUTS.value > 0:
-      # TODO b/486861095
-      if op.name != "normal":
-        print_reproducer(subtest_name, op, golden_input, variant)
-      print_op_input(torch_tpu_printable_input, data=_PRINT_OP_INPUTS.value > 1)
-
-    opt_level = _OPT_LEVEL.value
-    if opt_level:
-      compiler_options = {"xla_optimization_level": opt_level}
-    else:
-      compiler_options = {}
-    with compiler.custom_compiler_options(compiler_options):
-      torch_tpu_result = self._run_op(
-          op=op,
-          variant=variant,
-          dtype=dtype,
-          op_input=golden_input,
-          compute_grad=compute_grad,
-          use_compiled=use_compiled,
-          device=torch.device("tpu"),
-          subtest_name=subtest_name,
-          check_device=check_device,
-          check_dynamism=check_dynamism,
-          out_dtype_override=out_dtype_override,
-      )
-    if _perf_mode():
-      # In perf mode, performance measurement is completed during self._run_op
-      # on TPU above. Return early to avoid running behavioral and failure
-      # consistency comparisons against the golden results.
-      return
+    torch_tpu_result, torch_tpu_printable_input = self._run_on_tpu(
+        subtest_name,
+        op,
+        variant,
+        dtype,
+        golden_input=golden_input,
+        compute_grad=compute_grad,
+        use_compiled=use_compiled,
+        **run_op_kwargs,
+    )
     golden_thrown = isinstance(golden_result, Exception)
     torch_tpu_thrown = isinstance(torch_tpu_result, Exception)
 
@@ -5392,6 +5613,8 @@ class OpInfoTestBase(TorchTpuTestBase):
         the --max_samples_per_op_dtype flag.
     """
 
+    # do_test_op() already rejects LOOSE, so this never fires today. Keep it to
+    # catch mistakes by future callers.
     if check_value == CheckValueMode.LOOSE:
       raise ValueError(
           "LOOSE mode is the default. Please omit the check_value argument."
@@ -5402,10 +5625,6 @@ class OpInfoTestBase(TorchTpuTestBase):
           f"Skipping test for dtype {dtype} as it is not in --dtypes.",
           flush=True,
       )
-      return
-
-    if variant == OpVariant.INPLACE and not op.inplace_variant:
-      print(f"Op {op.name} does not have an inplace variant.", flush=True)
       return
 
     op_name = _op_name_for_logging(op, variant)
@@ -5425,6 +5644,17 @@ class OpInfoTestBase(TorchTpuTestBase):
         max_samples=max_samples_per_op_dtype,
         out_dtype_override=out_dtype_override,
     )
+    if _gen_gpu_golden_mode():
+      for golden_pair in golden_pairs:
+        _GOLDEN_GPU_DATA.add(
+            self._testMethodName,
+            variant,
+            dtype,
+            *golden_pair,
+            out_dtype_override=out_dtype_override,
+        )
+      return
+
     for i, [golden_input, golden_output] in enumerate(golden_pairs):
       golden_result = golden_output.output_value
       golden_thrown = isinstance(golden_result, Exception)
@@ -5436,9 +5666,6 @@ class OpInfoTestBase(TorchTpuTestBase):
             f"Error: {golden_result}\n",
             flush=True,
         )
-        continue
-
-      if _gen_gpu_golden_mode():
         continue
 
       if skip_if and skip_if(variant, golden_input):
@@ -5456,43 +5683,34 @@ class OpInfoTestBase(TorchTpuTestBase):
       subtest_name = f"{op_name}_{_dtype_str(dtype)}_"
       subtest_name += golden_input.name if golden_input.name else f"subtest{i}"
 
+      if _perf_mode():
+        test = functools.partial(self._run_on_tpu, measure_perf=True)
+      else:
+        test = functools.partial(
+            self._sub_test,
+            golden_result=golden_result,
+            check_value=check_value,
+            check_dtype=check_dtype,
+            skip_output_indices=skip_output_indices,
+        )
       for perf_run_idx in range(_NUM_RUNS_PER_SUBTEST.value):
         self._subtests_run += 1
         with self.subTest(subtest_name=subtest_name, run_index=perf_run_idx):
           _run_and_print_exception(
               functools.partial(
-                  self._sub_test,
+                  test,
                   subtest_name,
                   op,
                   variant,
                   dtype,
                   golden_input=golden_input,
-                  golden_result=golden_result,
                   check_device=check_device,
                   check_dynamism=check_dynamism,
-                  check_value=check_value,
-                  check_dtype=check_dtype,
-                  skip_output_indices=skip_output_indices,
                   compute_grad=compute_grad,
                   use_compiled=use_compiled,
                   out_dtype_override=out_dtype_override,
               )
           )
-
-  def _resolve_exclude_dtypes(
-      self,
-      exclude_dtypes: Iterable[torch.dtype] | None,
-  ) -> Sequence[torch.dtype]:
-    """Resolves the exclude_dtypes argument."""
-    if _gen_gpu_golden_mode():
-      # During golden generation, we ignore all exclusions (both general and
-      # device-specific) to proactively collect as much golden data as
-      # possible for future compatibility.
-      # Robustness against GPU-unsupported cases is handled by catching
-      # exceptions during sample generation.
-      return ()
-
-    return tuple(exclude_dtypes or ())
 
   def do_test_op(
       self,
@@ -5582,10 +5800,15 @@ class OpInfoTestBase(TorchTpuTestBase):
           "LOOSE mode is the default. Please omit the check_value argument."
       )
 
+    recording = _gen_gpu_golden_mode()
     raw_exclude_dtypes = exclude_dtypes
-    exclude_dtypes = self._resolve_exclude_dtypes(exclude_dtypes)
-    exclude_inplace_dtypes = self._resolve_exclude_dtypes(
-        exclude_inplace_dtypes
+    # During golden generation, we ignore all exclusions (both general and
+    # device-specific) to proactively collect as much golden data as possible
+    # for future compatibility. Robustness against GPU-unsupported cases is
+    # handled by catching exceptions during sample generation.
+    exclude_dtypes = () if recording else tuple(exclude_dtypes or ())
+    exclude_inplace_dtypes = (
+        () if recording else tuple(exclude_inplace_dtypes or ())
     )
     skip_output_indices = skip_output_indices or []
     compute_grad = _COMPUTE_GRAD.value
@@ -5602,177 +5825,78 @@ class OpInfoTestBase(TorchTpuTestBase):
       Currently only the out variant can be disabled (via check_out_variant).
       """
       op = _get_op(op_name, variant_test_name=variant_test_name)
-      dtypes_to_test = list(UNQUANTIZED_NUMERIC_DTYPES)
-      if _gen_gpu_golden_mode():
-        # Include quantized numeric dtypes during GPU golden data generation.
-        dtypes_to_test.extend(quantize_utils.QUANTIZED_NUMERIC_DTYPES)
-      elif _torch_tpu_vs_gpu_mode() or _perf_mode():
-        # When reading GPU goldens, include quantized numeric dtypes if the op
-        # explicitly declares support for them in its OpInfo.
-        dtypes_to_test.extend([
-            d
-            for d in getattr(op, "dtypes", ())
-            if d in quantize_utils.QUANTIZED_NUMERIC_DTYPES
-        ])
-      dtypes_to_test = list(dict.fromkeys(dtypes_to_test))
-      applicable_dtypes = [
-          d
+      dtypes_to_test = _dtypes_to_test_for_op(op, recording)
+      # No applicable dtypes means exclude_dtypes intentionally excluded
+      # everything, so skipping is expected.
+      if all(
+          _should_skip_dtype(d, exclude_dtypes=exclude_dtypes)
           for d in dtypes_to_test
-          if not _should_skip_dtype(d, exclude_dtypes=exclude_dtypes)
-      ]
-      # Applicable_dtypes empty means dtypes explicitly excluded everything. That is intentional, so skipping is expected.
-      if not applicable_dtypes:
+      ):
         self.skipTest(
-            f"All dtypes excluded for {op_name} on {self.golden_device_name()}:"
-            f" exclude_dtypes={exclude_dtypes}"
+            f"All dtypes excluded for {op_name} on"
+            f" {self.golden_device_name()}: exclude_dtypes={exclude_dtypes}"
         )
 
-      # Test the base variant.
-      print(f"Testing {op_name}().", flush=True)
-      for dtype in dtypes_to_test:
-        if _should_skip_dtype(dtype, exclude_dtypes=exclude_dtypes):
-          continue
-        self._test_torch_tpu_vs_golden(
-            op,
-            dtype,
-            OpVariant.BASE,
-            compute_grad=compute_grad,
-            use_compiled=use_compiled,
-            check_value=check_value,
-            check_dtype=check_dtype,
-            check_device=check_device,
-            check_dynamism=check_dynamism,
-            check_op_failures=check_op_failures,
-            skip_output_indices=skip_output_indices,
-            skip_if=skip_if,
-            max_samples_per_op_dtype=max_samples_per_op_dtype,
-        )
-
-      # Test the out variant.
+      # (variant, excluded dtypes, check_op_failures) for each variant to test.
+      variants = [(OpVariant.BASE, exclude_dtypes, check_op_failures)]
       if check_out_variant and _supports_out(op):
-        print(f"Testing {op_name}(out=...).", flush=True)
+        variants.append((OpVariant.OUT, exclude_dtypes, check_op_failures))
+      if op.inplace_variant:
+        variants.append((
+            OpVariant.INPLACE,
+            exclude_inplace_dtypes,
+            check_inplace_op_failures,
+        ))
+      out_casting_tests = _out_casting_tests(
+          op,
+          dtypes_to_test,
+          exclude_dtypes=tuple(raw_exclude_dtypes or ()),
+          check_op_failures=check_op_failures,
+          compute_grad=compute_grad,
+          use_compiled=use_compiled,
+          recording=recording,
+      )
 
-        op_exclude_dtypes = tuple(raw_exclude_dtypes or ())
-        # Select one valid promotional upcast pair (allowed_pair, e.g., float32
-        # -> float64) and one invalid downcast pair (illegal_pair, e.g.,
-        # float32 -> int32) from the dtypes to be tested. These will be used
-        # below to test out-variant dtype casting and exception parity between
-        # TorchTPU and GPU.
-        cast_pairs = find_cast_pairs([
-            d
-            for d in dtypes_to_test
-            if not _should_skip_dtype(d, exclude_dtypes=op_exclude_dtypes)
-        ])
-        test_out_casting = (
-            op.name not in _OUT_DTYPE_CAST_KNOWN_FAILURES
-            and not (
-                use_compiled
-                and op.name in _COMPILED_OUT_DTYPE_CAST_KNOWN_FAILURES
-            )
+      for (
+          variant,
+          variant_exclude_dtypes,
+          variant_check_op_failures,
+      ) in variants:
+        print(
+            f"Testing {_VARIANT_CALL_FORMAT[variant].format(op_name)}.",
+            flush=True,
         )
-
-        def _should_test_out_casting(
-            cast_pair: tuple[torch.dtype, torch.dtype] | None,
-        ) -> TypeGuard[tuple[torch.dtype, torch.dtype]]:
-          # Out-variant casting tests exception parity and type promotion in
-          # forward evaluations and is not applicable when computing gradients.
-          if compute_grad:
-            return False
-          # In golden generation mode, always capture golden data regardless of
-          # whether the op is known to fail on TPU.
-          return (
-              (_gen_gpu_golden_mode() or test_out_casting)
-              and cast_pair is not None
-              and dtype == cast_pair[0]
-          )
-
         for dtype in dtypes_to_test:
-          if _should_skip_dtype(dtype, exclude_dtypes=exclude_dtypes):
+          if _should_skip_dtype(dtype, exclude_dtypes=variant_exclude_dtypes):
             continue
-
-          self._test_torch_tpu_vs_golden(
+          test = functools.partial(
+              self._test_torch_tpu_vs_golden,
               op,
               dtype,
-              OpVariant.OUT,
+              variant,
               compute_grad=compute_grad,
               use_compiled=use_compiled,
               check_value=check_value,
               check_dtype=check_dtype,
               check_device=check_device,
               check_dynamism=check_dynamism,
-              check_op_failures=check_op_failures,
               skip_output_indices=skip_output_indices,
               skip_if=skip_if,
+          )
+          test(
+              check_op_failures=variant_check_op_failures,
               max_samples_per_op_dtype=max_samples_per_op_dtype,
           )
-
-          # If this dtype is the input dtype of the allowed cast pair, run an
-          # additional out-variant test with out_dtype_override set to the
-          # target upcast dtype to verify that TorchTPU correctly supports
-          # out-variant promotional upcasting.
-          if _should_test_out_casting(cast_pairs.allowed_pair):
-            self._test_torch_tpu_vs_golden(
-                op,
-                dtype,
-                OpVariant.OUT,
-                compute_grad=compute_grad,
-                use_compiled=use_compiled,
-                check_value=check_value,
-                check_dtype=check_dtype,
-                check_device=check_device,
-                check_dynamism=check_dynamism,
-                check_op_failures=check_op_failures,
-                skip_output_indices=skip_output_indices,
-                skip_if=skip_if,
+          if variant != OpVariant.OUT:
+            continue
+          for out_dtype, cast_check_op_failures in out_casting_tests.get(
+              dtype, ()
+          ):
+            test(
+                check_op_failures=cast_check_op_failures,
                 max_samples_per_op_dtype=1,
-                out_dtype_override=cast_pairs.allowed_pair[1],
+                out_dtype_override=out_dtype,
             )
-
-          # If this dtype is the input dtype of the illegal cast pair, run an
-          # additional out-variant test with out_dtype_override set to the
-          # target downcast dtype to verify that TorchTPU raises the same
-          # RuntimeError (exception parity) as PyTorch/GPU.
-          if _should_test_out_casting(cast_pairs.illegal_pair):
-            self._test_torch_tpu_vs_golden(
-                op,
-                dtype,
-                OpVariant.OUT,
-                compute_grad=compute_grad,
-                use_compiled=use_compiled,
-                check_value=check_value,
-                check_dtype=check_dtype,
-                check_device=check_device,
-                check_dynamism=check_dynamism,
-                check_op_failures=True,
-                skip_output_indices=skip_output_indices,
-                skip_if=skip_if,
-                max_samples_per_op_dtype=1,
-                out_dtype_override=cast_pairs.illegal_pair[1],
-            )
-
-      if not op.inplace_variant:
-        return
-
-      # Test the inplace variant.
-      print(f"Testing {op_name}_().", flush=True)
-      for dtype in dtypes_to_test:
-        if _should_skip_dtype(dtype, exclude_dtypes=exclude_inplace_dtypes):
-          continue
-        self._test_torch_tpu_vs_golden(
-            op,
-            dtype,
-            OpVariant.INPLACE,
-            compute_grad=compute_grad,
-            use_compiled=use_compiled,
-            check_value=check_value,
-            check_dtype=check_dtype,
-            check_device=check_device,
-            check_dynamism=check_dynamism,
-            check_op_failures=check_inplace_op_failures,
-            skip_output_indices=skip_output_indices,
-            skip_if=skip_if,
-            max_samples_per_op_dtype=max_samples_per_op_dtype,
-        )
 
     _run_and_print_exception(_test_op_variants)
 
