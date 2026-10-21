@@ -314,7 +314,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> AtenNativeBatchNorm(
     double momentum, double eps) {
   TT_KERNEL(OpName::kNativeBatchNorm, param_keys,
             (input, weight, bias, running_mean, running_variance, training,
-             momentum, eps),
+             IgnoreInCacheKey(momentum, "Doesn't affect SHLO"), eps),
             {
               TT_ASSIGN_OR_THROW(
                   (auto [output, mean, variance_inverse]),
@@ -338,8 +338,9 @@ std::tuple<at::Tensor&, at::Tensor&, at::Tensor&> AtenNativeBatchNormOut(
     at::Tensor& save_invstd) {
   TT_KERNEL(
       OpName::kNativeBatchNormOut, param_keys,
-      (input, weight, bias, running_mean, running_variance, training, momentum,
-       eps, out, save_mean, save_invstd),
+      (input, weight, bias, running_mean, running_variance, training,
+       IgnoreInCacheKey(momentum, "Doesn't affect SHLO"), eps, out, save_mean,
+       save_invstd),
       {
         TT_THROW_IF_ERROR(TpuBatchNormOut(
             input, SanitizeOptionalTensor(weight), SanitizeOptionalTensor(bias),
@@ -394,8 +395,9 @@ std::tuple<at::Tensor&, at::Tensor&, at::Tensor&> AtenNativeBatchNormLegitOut(
     at::Tensor& out, at::Tensor& save_mean, at::Tensor& save_invstd) {
   TT_KERNEL(
       OpName::kNativeBatchNormLegitOut, param_keys,
-      (input, weight, bias, running_mean, running_variance, training, momentum,
-       eps, out, save_mean, save_invstd),
+      (input, weight, bias, running_mean, running_variance, training,
+       IgnoreInCacheKey(momentum, "Doesn't affect SHLO"), eps, out, save_mean,
+       save_invstd),
       {
         TT_THROW_IF_ERROR(TpuBatchNormOut(
             input, SanitizeOptionalTensor(weight), SanitizeOptionalTensor(bias),
@@ -416,7 +418,8 @@ AtenNativeBatchNormLegitNoStatsOut(const at::Tensor& input,
                                    at::Tensor& save_invstd) {
   TT_KERNEL(
       OpName::kNativeBatchNormLegitNoStatsOut, param_keys,
-      (input, weight, bias, training, momentum, eps, out, save_mean,
+      (input, weight, bias, training,
+       IgnoreInCacheKey(momentum, "Doesn't affect SHLO"), eps, out, save_mean,
        save_invstd),
       {
         TT_THROW_IF_ERROR(TpuBatchNormOut(

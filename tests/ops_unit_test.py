@@ -2333,6 +2333,35 @@ class OpsUnitTest(TorchTpuVsCpuTestBase):
     # Relax tolerances because we are running in BF16 on TPU for performance.
     self.assert_close_tpu_vs_cpu(run_forward, rtol=3e-2, atol=2e-2)
 
+  @parameterized.parameters(0.1, None)
+  def test_batch_norm_training_momentum_does_not_recompile(self, momentum):
+    """Tests that BatchNorm training steps reuse the compiled program.
+
+    With `momentum=None`, `nn.BatchNorm2d` passes `1 / num_batches_tracked` as
+    the momentum, so its value changes on every step. The momentum must not
+    cause a new compilation on every step.
+
+    Args:
+      momentum: The momentum of the BatchNorm module.
+    """
+    x = torch.randn(8, 3, 16, 16).to("tpu")
+    bn = torch.nn.BatchNorm2d(3, momentum=momentum).to("tpu").train()
+
+    compilations_per_step = []
+    for _ in range(6):
+      before = torch.tpu._get_cache_stats().num_compilations
+      bn(x).cpu()
+      compilations_per_step.append(
+          torch.tpu._get_cache_stats().num_compilations - before
+      )
+
+    # The first step may compile; later steps must hit the compilation cache.
+    self.assertEqual(
+        compilations_per_step[1:],
+        [0] * 5,
+        f"compilations per step: {compilations_per_step}",
+    )
+
   @parameterized.product(training=[True, False], has_weight=[True, False])
   def test_batch_norm_backward_mixed_dtype(self, training, has_weight):
     """Tests batch_norm_backward with mixed BF16 input and F32 stats."""
