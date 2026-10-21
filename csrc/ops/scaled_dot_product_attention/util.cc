@@ -19,7 +19,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <optional>
 #include <string>
 
 #include "absl/base/casts.h"
@@ -97,26 +96,6 @@ SmallVector<Value> TileIndices(ImplicitLocOpBuilder& b, MemRefType arg_type,
         arith::ConstantOp::create(b, b.getIndexAttr(col_offset));
   }
   return indices;
-}
-
-// Global index of the last element in `block_idx`:
-// `(block_idx + 1) * block_size - 1`.
-Value BlockEndIndex(ImplicitLocOpBuilder& b, Value block_idx, Value block_size,
-                    Value c1) {
-  return arith::SubIOp::create(
-      b,
-      arith::MulIOp::create(b, arith::AddIOp::create(b, block_idx, c1),
-                            block_size),
-      c1);
-}
-
-// Compares `row - col` against `sliding_window_size` using `pred`.
-Value CmpWindowDistance(ImplicitLocOpBuilder& b, arith::CmpIPredicate pred,
-                        Value row, Value col, int64_t sliding_window_size) {
-  const Value window_size =
-      arith::ConstantOp::create(b, b.getI32IntegerAttr(sliding_window_size));
-  return arith::CmpIOp::create(b, pred, arith::SubIOp::create(b, row, col),
-                               window_size);
 }
 
 }  // namespace
@@ -227,8 +206,7 @@ Value ApplyStructuredMask(ImplicitLocOpBuilder& b, Value sij,
                           Value row_block_idx, Value col_block_idx, int64_t qt,
                           int64_t kt, int64_t q_seq_len, int64_t kv_seq_len,
                           bool is_causal, int64_t row_offset,
-                          int64_t col_offset,
-                          std::optional<int64_t> sliding_window_size) {
+                          int64_t col_offset) {
   bool mask_q_seq_len = (q_seq_len % qt) != 0;
   bool mask_kv_seq_len = (kv_seq_len % kt) != 0;
 
@@ -272,20 +250,6 @@ Value ApplyStructuredMask(ImplicitLocOpBuilder& b, Value sij,
     valid_mask = arith::CmpIOp::create(b, arith::CmpIPredicate::sge,
                                        row_indices, col_indices);
   }
-  // Restrict causal attention to keys within `sliding_window_size` of each
-  // query (`row - col < sliding_window_size`).
-  if (is_causal && sliding_window_size.has_value()) {
-    const Value window_size_vector = vector::BroadcastOp::create(
-        b, mask_shape_i32,
-        arith::ConstantOp::create(b,
-                                  b.getI32IntegerAttr(*sliding_window_size)));
-    const Value row_col_distance =
-        arith::SubIOp::create(b, row_indices, col_indices);
-    valid_mask = arith::AndIOp::create(
-        b, valid_mask,
-        arith::CmpIOp::create(b, arith::CmpIPredicate::slt, row_col_distance,
-                              window_size_vector));
-  }
 
   if (mask_q_seq_len) {
     auto q_seq_len_const =
@@ -313,10 +277,9 @@ Value ApplyStructuredMask(ImplicitLocOpBuilder& b, Value sij,
   return arith::SelectOp::create(b, valid_mask, sij, masking_vector);
 }
 
-Value CreateIntersectsDiagCondition(
-    ImplicitLocOpBuilder& b, Value row_idx, Value col_idx,
-    int64_t row_block_size, int64_t col_block_size,
-    std::optional<int64_t> sliding_window_size) {
+Value CreateIntersectsDiagCondition(ImplicitLocOpBuilder& b, Value row_idx,
+                                    Value col_idx, int64_t row_block_size,
+                                    int64_t col_block_size) {
   // The tile contains a masked element iff its last column index is greater
   // than its first row index:
   //   (col_idx + 1) * col_block_size - 1 > row_idx * row_block_size.
@@ -330,21 +293,8 @@ Value CreateIntersectsDiagCondition(
   Value last_col = arith::SubIOp::create(
       b, arith::MulIOp::create(b, col_idx_plus_1, col_size_value), c1);
   Value first_row = arith::MulIOp::create(b, row_idx, row_size_value);
-  const Value cond =
-      arith::CmpIOp::create(b, arith::CmpIPredicate::sgt, last_col, first_row);
-  if (!sliding_window_size.has_value()) {
-    return cond;
-  }
-
-  // Also apply element-wise masking when the tile straddles the lower boundary
-  // of the sliding window (its bottom-left corner `(last_row, first_col)` has
-  // `last_row - first_col >= sliding_window_size`).
-  const Value last_row = BlockEndIndex(b, row_idx, row_size_value, c1);
-  const Value first_col = arith::MulIOp::create(b, col_idx, col_size_value);
-  return arith::OrIOp::create(
-      b, cond,
-      CmpWindowDistance(b, arith::CmpIPredicate::sge, last_row, first_col,
-                        *sliding_window_size));
+  return arith::CmpIOp::create(b, arith::CmpIPredicate::sgt, last_col,
+                               first_row);
 }
 
 Value ReduceBroadcastLane(ImplicitLocOpBuilder& b, Value input,
@@ -384,8 +334,7 @@ Value ClampMinFinite(ImplicitLocOpBuilder& b, Value input) {
 
 Value CreateBelowOrOnDiagCondition(ImplicitLocOpBuilder& b, Value row_idx,
                                    Value col_idx, int64_t row_block_size,
-                                   int64_t col_block_size,
-                                   std::optional<int64_t> sliding_window_size) {
+                                   int64_t col_block_size) {
   auto row_size_value =
       arith::ConstantOp::create(b, b.getI32IntegerAttr(row_block_size));
   auto col_size_value =
@@ -398,28 +347,14 @@ Value CreateBelowOrOnDiagCondition(ImplicitLocOpBuilder& b, Value row_idx,
 
   Value rhs = arith::MulIOp::create(b, col_idx, col_size_value);
 
-  const Value cond =
-      arith::CmpIOp::create(b, arith::CmpIPredicate::sge, lhs_minus_1, rhs);
-  if (!sliding_window_size.has_value()) {
-    return cond;
-  }
-
-  // Keep only tiles whose top-right corner `(first_row, last_col)` is within
-  // the sliding window (`first_row - last_col < sliding_window_size`).
-  const Value first_row = arith::MulIOp::create(b, row_idx, row_size_value);
-  const Value last_col = BlockEndIndex(b, col_idx, col_size_value, c1);
-  return arith::AndIOp::create(
-      b, cond,
-      CmpWindowDistance(b, arith::CmpIPredicate::slt, first_row, last_col,
-                        *sliding_window_size));
+  return arith::CmpIOp::create(b, arith::CmpIPredicate::sge, lhs_minus_1, rhs);
 }
 
 scf::IfOp CreateCausalIfOp(ImplicitLocOpBuilder& b, Value row_idx,
                            Value col_idx, int64_t row_block_size,
-                           int64_t col_block_size,
-                           std::optional<int64_t> sliding_window_size) {
-  Value cond = CreateBelowOrOnDiagCondition(
-      b, row_idx, col_idx, row_block_size, col_block_size, sliding_window_size);
+                           int64_t col_block_size) {
+  Value cond = CreateBelowOrOnDiagCondition(b, row_idx, col_idx, row_block_size,
+                                            col_block_size);
   return scf::IfOp::create(b, cond, /*withElse=*/false);
 }
 
@@ -545,9 +480,8 @@ KVWindowMaps CreateKVWindowMaps(OpBuilder& builder, func::FuncOp fn,
     if (config.is_causal) {
       // If the kv block is skipped, prefetch the next valid kv block, i.e. the
       // 0th one to be used for the next block_q rows.
-      Value cond =
-          CreateBelowOrOnDiagCondition(fn_b, q_tile, kv_tile, tiling.qt,
-                                       tiling.kt, config.sliding_window_size);
+      Value cond = CreateBelowOrOnDiagCondition(fn_b, q_tile, kv_tile,
+                                                tiling.qt, tiling.kt);
       next_kv_tile = arith::SelectOp::create(fn_b, cond, kv_tile, c0);
     }
 

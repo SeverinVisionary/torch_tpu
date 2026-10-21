@@ -247,14 +247,14 @@ SoftmaxState UpdateSoftmaxState(ImplicitLocOpBuilder& b,
   }
 
   if (apply_masking) {
-    sij = ApplyStructuredMask(
-        b, sij, args.row_block_idx, args.col_block_idx, tiling.qt, tiling.kt,
-        config.q_sequence_length, config.kv_sequence_length, config.is_causal,
-        row_offset, col_offset, config.sliding_window_size);
+    sij = ApplyStructuredMask(b, sij, args.row_block_idx, args.col_block_idx,
+                              tiling.qt, tiling.kt, config.q_sequence_length,
+                              config.kv_sequence_length, config.is_causal,
+                              row_offset, col_offset);
   }
 
   Value mij = ReduceBroadcastLane(b, sij, CombiningKind::MAXIMUMF);
-  if (args.mask_arg || config.sliding_window_size.has_value()) {
+  if (args.mask_arg) {
     // Clamping mij instead of sij ensures that when a row is entirely masked
     // out with -inf, sij - mij evaluates to (-inf) - (<large negative finite>)
     // = -inf, so exp2(-inf) = 0.0 naturally without any vector compare or
@@ -354,8 +354,7 @@ void EmitGridStep(ImplicitLocOpBuilder& b, const FlashAttnConfig& config,
   // On a square diagonal tile the row and column block indices are equal, so
   // with band_rows == kc, sub-block (band, kv_block) is fully masked iff
   // kv_block > band and needs masking iff kv_block == band.
-  const bool square_causal_diag_block = intersects_causal_diag && qt == kt &&
-                                        !config.sliding_window_size.has_value();
+  const bool square_causal_diag_block = intersects_causal_diag && qt == kt;
   const int64_t band_rows = square_causal_diag_block ? kc : qt;
   const int64_t num_bands = qt / band_rows;
 
@@ -474,10 +473,9 @@ func::FuncOp buildModule(ImplicitLocOpBuilder& module_builder,
 
   ConstantOp zero = ConstantOp::create(fn_builder, fn_builder.getZeroAttr(i32));
   std::optional<scf::IfOp> causal_if;
-  if (config.is_causal && !config.sliding_window_size.has_value()) {
-    causal_if =
-        CreateCausalIfOp(fn_builder, args.row_block_idx, args.col_block_idx, qt,
-                         kt, config.sliding_window_size);
+  if (config.is_causal) {
+    causal_if = CreateCausalIfOp(fn_builder, args.row_block_idx,
+                                 args.col_block_idx, qt, kt);
     fn_builder.setInsertionPointToStart(causal_if->thenBlock());
   }
 
@@ -495,22 +493,11 @@ func::FuncOp buildModule(ImplicitLocOpBuilder& module_builder,
         });
   }
 
-  // Scratch accumulators are reused across `row_block_idx` and reset at
-  // `col_block_idx == 0`. With a sliding window, `col_block_idx == 0` can be
-  // outside the window and skipped, so enter `causal_if` after the reset above.
-  if (config.is_causal && config.sliding_window_size.has_value()) {
-    causal_if =
-        CreateCausalIfOp(fn_builder, args.row_block_idx, args.col_block_idx, qt,
-                         kt, config.sliding_window_size);
-    fn_builder.setInsertionPointToStart(causal_if->thenBlock());
-  }
-
   if (config.is_causal) {
     // Only tiles that intersect the diagonal need masking; tiles strictly
     // below it are computed without any masking overhead.
     Value intersects_diag = CreateIntersectsDiagCondition(
-        fn_builder, args.row_block_idx, args.col_block_idx, qt, kt,
-        config.sliding_window_size);
+        fn_builder, args.row_block_idx, args.col_block_idx, qt, kt);
     scf::IfOp::create(
         fn_builder, intersects_diag,
         [&](OpBuilder& then_builder, Location then_loc) {

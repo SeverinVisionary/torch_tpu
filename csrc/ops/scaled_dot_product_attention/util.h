@@ -18,7 +18,6 @@
 #define TORCH_TPU_CSRC_OPS_SCALED_DOT_PRODUCT_ATTENTION_UTIL_H_
 
 #include <cstdint>
-#include <optional>
 #include <string>
 
 #include "csrc/ops/scaled_dot_product_attention/flash_attention_config.h"
@@ -86,9 +85,8 @@ bool NeedsPadMask(int64_t qt, int64_t kt, int64_t q_seq_len,
 Value ApplyStructuredMask(ImplicitLocOpBuilder& b, Value sij,
                           Value row_block_idx, Value col_block_idx, int64_t qt,
                           int64_t kt, int64_t q_seq_len, int64_t kv_seq_len,
-                          bool is_causal, int64_t row_offset,
-                          int64_t col_offset,
-                          std::optional<int64_t> sliding_window_size);
+                          bool is_causal, int64_t row_offset = 0,
+                          int64_t col_offset = 0);
 
 // Reduce the 2D input to a 1D across the lane dimension and then broadcast the
 // results lane dimension to the given size.
@@ -111,8 +109,7 @@ Value SplatNegInf(ImplicitLocOpBuilder& b, Type type);
 // is below or on the diagonal (i.e. intersects the causal mask).
 Value CreateBelowOrOnDiagCondition(ImplicitLocOpBuilder& b, Value row_idx,
                                    Value col_idx, int64_t row_block_size,
-                                   int64_t col_block_size,
-                                   std::optional<int64_t> sliding_window_size);
+                                   int64_t col_block_size);
 
 // Returns an i1 condition indicating whether the tile at (row_idx, col_idx)
 // contains at least one element strictly above the diagonal, i.e. whether a
@@ -120,15 +117,13 @@ Value CreateBelowOrOnDiagCondition(ImplicitLocOpBuilder& b, Value row_idx,
 // need no masking.
 Value CreateIntersectsDiagCondition(ImplicitLocOpBuilder& b, Value row_idx,
                                     Value col_idx, int64_t row_block_size,
-                                    int64_t col_block_size,
-                                    std::optional<int64_t> sliding_window_size);
+                                    int64_t col_block_size);
 
 // Create an scf.IfOp where the then block will be executed when
 // row_idx >= col_idx.
 scf::IfOp CreateCausalIfOp(ImplicitLocOpBuilder& b, Value row_idx,
                            Value col_idx, int64_t row_block_size,
-                           int64_t col_block_size,
-                           std::optional<int64_t> sliding_window_size);
+                           int64_t col_block_size);
 
 // Scale the input vector by the given scale factor.
 Value ScaleValue(ImplicitLocOpBuilder& b, Value input, float scale);

@@ -100,10 +100,9 @@ SharedBwdResult ComputeSharedBackwardLogic(
     sij = AddFOp::create(fn_builder, sij, user_bias);
   }
 
-  sij = ApplyStructuredMask(
-      fn_builder, sij, row_block_idx, col_block_idx, qt, kt,
-      config.q_sequence_length, config.kv_sequence_length, config.is_causal,
-      /*row_offset=*/0, /*col_offset=*/0, config.sliding_window_size);
+  sij = ApplyStructuredMask(fn_builder, sij, row_block_idx, col_block_idx, qt,
+                            kt, config.q_sequence_length,
+                            config.kv_sequence_length, config.is_causal);
 
   Value lse_broadcast =
       BroadcastOp::create(fn_builder, vector_type_qt_kt, lse_tile);
@@ -300,8 +299,7 @@ func::FuncOp buildBackwardDkvModule(ImplicitLocOpBuilder& module_builder,
 
   std::optional<IfOp> causal_if;
   if (config.is_causal) {
-    causal_if = CreateCausalIfOp(fn_builder, q_tile_idx, kv_tile_idx, qt, kt,
-                                 config.sliding_window_size);
+    causal_if = CreateCausalIfOp(fn_builder, q_tile_idx, kv_tile_idx, qt, kt);
     fn_builder.setInsertionPointToStart(causal_if->thenBlock());
   }
 
@@ -669,9 +667,8 @@ func::FuncOp buildBackwardDqModule(ImplicitLocOpBuilder& module_builder,
 
   std::optional<IfOp> causal_if;
   if (config.is_causal) {
-    causal_if =
-        CreateCausalIfOp(fn_builder, fn.getArgument(2), fn.getArgument(3), qt,
-                         kt, config.sliding_window_size);
+    causal_if = CreateCausalIfOp(fn_builder, fn.getArgument(2),
+                                 fn.getArgument(3), qt, kt);
     fn_builder.setInsertionPointToStart(causal_if->thenBlock());
   }
 
