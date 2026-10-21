@@ -139,9 +139,12 @@ torch_tpu_cc_test(
     },
     tags = ["requires-tpu-v5lite"],
     deps = [
+        ":current_stream",
         ":device_buffer",
         ":device_buffer_utils",
+        ":events_queue",
         ":materialize",
+        ":split_traversal",
         ":structured_log_buffer",
         ":tensor_to_buffer",
         ":tpu_hooks",
@@ -164,8 +167,10 @@ torch_tpu_cc_test(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/types:span",
+        "@llvm-project//mlir:IR",
         "@stablehlo//stablehlo/integrations/cpp/builder:attr_type_builder_util",
         "@stablehlo//stablehlo/integrations/cpp/builder:mlir_builder",
+        "@stablehlo//stablehlo/integrations/cpp/builder:stablehlo_builder",
     ],
 )
 

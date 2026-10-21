@@ -302,28 +302,38 @@ absl::StatusOr<CompiledTraversal> VerifyAndCompileTraversal(
                 "appear in compiled mode, which should never try to "
                 "materialize tensors.\n"
              << argument.DebugString();
-    } else if (argument.is_materialized()) {
-      // Argument has either succeeded or failed; check that it didn't fail.
-      // AwaitBuffer is non-blocking when is_materialized() is true.
+    } else if (argument.is_executing()) {
+      // Argument has had a PjRtBuffer already created for it, so we can
+      // check immediately to see if it is in a failed state.
       auto buffer_or = argument.AwaitBuffer();
       if (!buffer_or.ok()) {
-        return TT_ERROR(error::kFailedPrecondition)
-               << "a required argument is in a failed state";
+        // Don't prefix or suffix this here; if there is a chain of tasks and
+        // one of them fails, anything appended here gets duplicated over and
+        // over. Just let the original error flow down the chained tasks.
+        return buffer_or.status();
       }
     } else if (argument.is_materializing()) {
-      // Input isn't ready yet, so we will wait and recheck it during Run().
+      // Input has been pushed onto the execution thread, but has not yet been
+      // assigned a PjRtBuffer. We will recheck it once this task reaches the
+      // front of the execution queue (see GetArgumentBuffers).
       continue;
     } else if (const auto deferred_op = argument.deferred_op()) {
+      // Surface the cache key only in the ABSL_LOG, not in the TT_ERROR.
       const CompilationCacheKey compilation_cache_key =
           traversal.GetCacheKey(compilation_spec.compile_options_key,
                                 /*argument_layouts=*/{},
                                 /*donated_inputs=*/{});
-      return TT_ERROR(error::kInternal)
-             << "traversal (cache key: " << compilation_cache_key
-             << ") has deferred argument " << ToString(deferred_op->op_name())
-             << ToString(argument.dimensions())
-             << ".\nAll arguments must be set to pending materialization "
-                "before creating chained ExecutionTasks";
+      ABSL_LOG(ERROR)
+          << "traversal (cache key: " << compilation_cache_key
+          << ") has deferred argument " << ToString(deferred_op->op_name())
+          << ToString(argument.dimensions())
+          << ".\nAll arguments must be set to pending materialization "
+             "before creating chained ExecutionTasks";
+      return TT_ERROR(error::kFailedPrecondition)
+             << "detected an out of order execution; an execution task "
+                "depends on an argument that is not scheduled for "
+                "materialization.\nIf you are using multiple streams, please "
+                "use torch.Events to coordinate cross-stream dependencies";
     } else {
       return TT_ERROR(error::kInternal)
              << "traversal argument has an unknown state (not deferred, "
@@ -611,11 +621,17 @@ absl::StatusOr<std::vector<xla::PjRtBuffer* absl_nullable>>
 ExecutionTask::GetArgumentBuffers() {
   std::vector<xla::PjRtBuffer*> root_args;
   for (const auto&& [index, argument] : llvm::enumerate(arguments_)) {
-    if (argument.is_materializing()) {
-      ABSL_VLOG(1) << "Materializing DeviceBufferRef index: " << index;
+    if (argument.is_executing()) {
+      ABSL_VLOG(1) << "Get PjRtBuffer for DeviceBufferRef index: " << index;
       TT_ASSIGN_OR_RETURN(xla::PjRtBuffer * pjrt_buffer,
                           argument.AwaitBuffer());
       root_args.push_back(pjrt_buffer);
+    } else if (argument.is_materializing()) {
+      return TT_ERROR(error::kFailedPrecondition)
+             << "detected an out of order execution; an earlier execution task "
+                "depends on an argument which will be materialized by a later "
+                "execution task.\nIf you are using multiple streams, please "
+                "use torch.Events to coordinate cross-stream dependencies";
     } else if (argument.is_placeholder()) {
       // This should already have been checked in MaterializeImpl, but we can
       // return the same error here if that check was somehow bypassed.
@@ -626,8 +642,11 @@ ExecutionTask::GetArgumentBuffers() {
                 "materialize tensors."
              << argument.DebugString();
     } else {
-      return TT_ERROR(error::kInternal)
-             << "Traversal input is unexpectedly deferred";
+      return TT_ERROR(error::kFailedPrecondition)
+             << "detected an out of order execution; an execution task "
+                "depends on an argument is not scheduled for "
+                "materialization.\nIf you are using multiple streams, please "
+                "use torch.Events to coordinate cross-stream dependencies";
     }
   }
   return root_args;

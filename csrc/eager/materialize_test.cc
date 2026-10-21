@@ -34,8 +34,11 @@
 #include "csrc/common/error_utils.h"
 #include "csrc/common/shape.h"
 #include "csrc/common/status_test_utils.h"
+#include "csrc/eager/current_stream.h"
 #include "csrc/eager/device_buffer.h"
 #include "csrc/eager/device_buffer_utils.h"
+#include "csrc/eager/events_queue.h"
+#include "csrc/eager/split_traversal.h"
 #include "csrc/eager/structured_log_buffer.h"
 #include "csrc/eager/tensor_to_buffer.h"
 #include "csrc/eager/tpu_hooks.h"
@@ -43,9 +46,12 @@
 #include "csrc/ops/op_names.h"
 #include "csrc/ops/python_context.h"
 #include "csrc/pjrt/pjrt_state.h"
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "stablehlo/integrations/cpp/builder/AttrTypeBuilderUtil.h"
 #include "stablehlo/integrations/cpp/builder/MlirBuilder.h"
+#include "stablehlo/integrations/cpp/builder/StablehloBuilder.h"
 
 namespace torch_tpu {
 namespace {
@@ -133,6 +139,103 @@ TEST_F(MaterializeTest, CompilerOptionsPropagateToMaterializeThread) {
   const PerfStats stats = CompilationCache::GetInstance().GetCacheStats();
   ASSERT_EQ(stats.per_entry_stats.size(), 1);
   EXPECT_EQ(stats.per_entry_stats[0].key.compile_options_key(), expected_key);
+}
+
+TEST_F(MaterializeTest, OutOfOrderUnexecutedDeferred) {
+  OpName op_name = OpName::kAdd;
+  ScopedPythonContextCapturer capturer(op_name);
+
+  // Create a deferred, non-constant buffer but do not register it with the
+  // events queue.
+  TT_ASSERT_OK_AND_ASSIGN(
+      std::vector<DeviceBufferRef> refs,
+      DeviceBufferList::CreateDeferred(
+          op_name,
+          [](mlir::MlirBuilder& builder, absl::Span<mlir::MlirOp> inputs)
+              -> absl::StatusOr<DynamicMlirOpResults> {
+            return DynamicMlirOpResults{};
+          },
+          {}, OpParamCacheKeys::Empty(),
+          {Shape{Dimensions{10}, mlir::ElementType::F32}}));
+  auto never_executed_deferred = refs[0];
+
+  // Create an op which depends on the deferred buffer and register it with the
+  // events queue.
+  TT_ASSERT_OK_AND_ASSIGN(
+      refs, DeviceBufferList::CreateDeferred(
+                op_name,
+                [](mlir::MlirBuilder& builder, absl::Span<mlir::MlirOp> inputs)
+                    -> absl::StatusOr<DynamicMlirOpResults> {
+                  auto ranked_tensor_type = mlir::makeTensorType(
+                      builder.getContext(), {0}, mlir::ElementType::F32);
+                  auto dense_elements_attr =
+                      mlir::DenseElementsAttr::getFromRawBuffer(
+                          ranked_tensor_type, {});
+                  return DynamicMlirOpResults{
+                      mlir::stablehlo::Constant(builder, dense_elements_attr)};
+                },
+                {never_executed_deferred}, OpParamCacheKeys::Empty(),
+                {Shape{Dimensions{0}, mlir::ElementType::F32}}));
+  auto depends_on_deferred = refs[0];
+  RecordDeferredOpCreated(depends_on_deferred.device_buffer_list());
+
+  // Try to materialize the dependent buffer in the background.
+  // This will fail on synchronization when the execution thread detects that
+  // the deferred buffer wasn't materialized first.
+  Materialize(depends_on_deferred, MaterializationReason::kExplicitSync,
+              GraphSplitMode::kSplitGraph,
+              MaterializationBlockMode::kNonBlocking)
+      .IgnoreError();
+  auto finished_status = depends_on_deferred.Synchronize();
+  EXPECT_THAT(finished_status,
+              testing::status::StatusIs(
+                  error::kFailedPrecondition,
+                  testing::HasSubstr("detected an out of order execution")));
+}
+
+TEST_F(MaterializeTest, OutOfOrderUnexecutedPending) {
+  // Create a buffer in the pending state.
+  const auto [device_index, stream_id] = GetCurrentDeviceStreamId();
+  TT_ASSERT_OK_AND_ASSIGN(DeviceBufferRef pending_buffer,
+                          DeviceBufferList::CreatePending(
+                              Shape{Dimensions{10}, mlir::ElementType::F32},
+                              device_index, stream_id));
+
+  // Create an op which depends on the pending buffer and register it with the
+  // events queue.
+  OpName op_name = OpName::kAdd;
+  ScopedPythonContextCapturer capturer(op_name);
+  TT_ASSERT_OK_AND_ASSIGN(
+      const std::vector<DeviceBufferRef> refs,
+      DeviceBufferList::CreateDeferred(
+          op_name,
+          [](mlir::MlirBuilder& builder, absl::Span<mlir::MlirOp> inputs)
+              -> absl::StatusOr<DynamicMlirOpResults> {
+            auto ranked_tensor_type = mlir::makeTensorType(
+                builder.getContext(), {0}, mlir::ElementType::F32);
+            auto dense_elements_attr =
+                mlir::DenseElementsAttr::getFromRawBuffer(ranked_tensor_type,
+                                                          {});
+            return DynamicMlirOpResults{
+                mlir::stablehlo::Constant(builder, dense_elements_attr)};
+          },
+          {pending_buffer}, OpParamCacheKeys::Empty(),
+          {Shape{Dimensions{0}, mlir::ElementType::F32}}));
+  auto depends_on_pending = refs[0];
+  RecordDeferredOpCreated(depends_on_pending.device_buffer_list());
+
+  // Try to materialize the dependent buffer. This will fail on synchronization
+  // when the execution thread detects that the pending buffer wasn't
+  // materialized first.
+  Materialize(depends_on_pending, MaterializationReason::kExplicitSync,
+              GraphSplitMode::kSplitGraph,
+              MaterializationBlockMode::kNonBlocking)
+      .IgnoreError();
+  auto finished_status = depends_on_pending.Synchronize();
+  EXPECT_THAT(finished_status,
+              testing::status::StatusIs(
+                  error::kFailedPrecondition,
+                  testing::HasSubstr("detected an out of order execution")));
 }
 
 class PinnedHostPropagationTest : public testing::Test {
