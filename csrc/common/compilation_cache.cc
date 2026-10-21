@@ -76,10 +76,13 @@
 #include "stablehlo/integrations/cpp/builder/AttrTypeBuilderUtil.h"
 #include "tsl/platform/numbers.h"
 #include "xla/hlo/utils/concurrency/concurrency_utils.h"
+#include "xla/layout.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/pjrt_compiler.h"
 #include "xla/pjrt/pjrt_device_dimensions.h"
 #include "xla/pjrt/pjrt_executable.h"
+#include "xla/util.h"
+#include "xla/xla_data.pb.h"
 
 ABSL_FLAG(int32_t, torch_tpu_internal_num_compilation_threads, 0,
           "The number of threads to use for compilation. If 0, use the default "
@@ -106,6 +109,51 @@ bool IsFutureReady(const SharedLoadedExecutableWithMetadataFuture& future) {
 }
 
 int GetNumCpus() { return sysconf(_SC_NPROCESSORS_ONLN); }
+
+// Resolves the on-device `xla::Layout` for each `Shape` in `shapes`: uses
+// `shape.layout()` directly when both `minor_to_major` and `tiles` are
+// populated, or queries `PjRtClient::GetDefaultLayout` otherwise.
+absl::StatusOr<std::vector<xla::Layout>> ResolveLayouts(
+    absl::Span<const Shape> shapes) {
+  std::vector<xla::Layout> layouts;
+  layouts.reserve(shapes.size());
+  xla::PjRtClient* client = nullptr;
+  for (const Shape& shape : shapes) {
+    if (shape.layout().has_value() && !shape.layout()->minor_to_major.empty() &&
+        !shape.layout()->tiles.empty()) {
+      const CustomLayout& custom_layout = *shape.layout();
+      std::vector<xla::Tile> tiles;
+      tiles.reserve(custom_layout.tiles.size());
+      for (const Indices& tile_dims : custom_layout.tiles) {
+        tiles.emplace_back(tile_dims);
+      }
+      const int64_t element_size_in_bits =
+          custom_layout.element_size_in_bits ==
+                  XlaEquivalentBitwidth(shape.dtype())
+              ? 0
+              : custom_layout.element_size_in_bits;
+      layouts.emplace_back(custom_layout.minor_to_major, tiles,
+                           element_size_in_bits);
+      continue;
+    }
+    if (client == nullptr) {
+      TT_ASSIGN_OR_RETURN(client, PjrtBackend::GetInstance().GetClient());
+    }
+    TT_ASSIGN_OR_RETURN(
+        xla::Layout layout,
+        AdaptXlaError(client->GetDefaultLayout(
+                          ConvertTo<xla::PrimitiveType>(shape.dtype()),
+                          shape.dimensions()),
+                      /*context=*/"failed to get default layout"));
+    if (shape.layout().has_value() && !shape.layout()->minor_to_major.empty()) {
+      *layout.mutable_minor_to_major() =
+          xla::DimensionVector(shape.layout()->minor_to_major.begin(),
+                               shape.layout()->minor_to_major.end());
+    }
+    layouts.push_back(std::move(layout));
+  }
+  return layouts;
+}
 
 }  // namespace
 
@@ -491,6 +539,8 @@ CompilationCache::GetUnboundedDynamicCacheEntry(
     return std::nullopt;
   }
 
+  std::optional<std::vector<xla::Layout>> input_layouts;
+  std::optional<std::vector<xla::Layout>> output_layouts;
   for (const auto& entry : it->second) {
     // In-flight entries are served as well: callers then wait on the same
     // future as the thread adding the entry instead of compiling themselves.
@@ -504,7 +554,19 @@ CompilationCache::GetUnboundedDynamicCacheEntry(
     }
     const UnboundedDynamicExecutionMetadata::CompatibilityFunc is_compatible =
         entry.dynamic_meta.is_compatible;
-    if (!is_compatible || is_compatible(input_shapes, output_shapes)) {
+    if (is_compatible != nullptr && !input_layouts.has_value()) {
+      absl::StatusOr<std::vector<xla::Layout>> resolved_inputs =
+          ResolveLayouts(input_shapes);
+      absl::StatusOr<std::vector<xla::Layout>> resolved_outputs =
+          ResolveLayouts(output_shapes);
+      if (!resolved_inputs.ok() || !resolved_outputs.ok()) {
+        return std::nullopt;
+      }
+      input_layouts = *std::move(resolved_inputs);
+      output_layouts = *std::move(resolved_outputs);
+    }
+    if (!is_compatible || is_compatible(input_shapes, *input_layouts,
+                                        output_shapes, *output_layouts)) {
       perf_stats_.num_cache_hits++;
       entry.cache_entry.stats().read_count++;
       entry.cache_entry.stats().last_read = absl::Now();
