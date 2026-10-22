@@ -133,4 +133,21 @@ torch_tpu_cc_library(
     ],
 )
 
+torch_tpu_cc_library(
+    name = "kiln_custom_call",
+    srcs = ["kiln_custom_call.cc"],
+    hdrs = ["kiln_custom_call.h"],
+    deps = [
+        "//csrc/common:error_utils",
+        "//csrc/internal/mosaic/kiln",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Support",
+        "@stablehlo//:stablehlo_ops",
+    ],
+)
+
 torch_tpu_package_end()

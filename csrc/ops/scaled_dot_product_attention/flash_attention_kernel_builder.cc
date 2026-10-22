@@ -36,8 +36,6 @@
 #include "absl/log/absl_check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "absl/strings/escaping.h"
-#include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "c10/core/ScalarType.h"
@@ -51,6 +49,7 @@
 #include "csrc/eager/op_dispatcher.h"
 #include "csrc/eager/tensor_to_buffer.h"
 #include "csrc/internal/mosaic/kiln/kiln.h"
+#include "csrc/internal/mosaic/kiln_custom_call.h"
 #include "csrc/ops/binary.h"
 #include "csrc/ops/op_builder_utils.h"
 #include "csrc/ops/precision_context.h"
@@ -64,15 +63,10 @@
 #include "csrc/pjrt/pjrt_state.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/Sequence.h"
 #include "llvm/Support/MathExtras.h"
-#include "mlir/IR/Attributes.h"
 #include "mlir/IR/Builders.h"
-#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
-#include "mlir/IR/TypeRange.h"
 #include "mlir/IR/Value.h"
-#include "mlir/IR/ValueRange.h"
 #include "mlir/Support/LLVM.h"
 #include "stablehlo/dialect/StablehloOps.h"
 #include "stablehlo/integrations/cpp/builder/AttrTypeBuilderUtil.h"
@@ -194,64 +188,6 @@ Tiling CreateTiling(int64_t q_seq_len, int64_t k_seq_len, int64_t head_dim,
       .kt = kt,
       .kc = GetKvComputeTileSize(kt),
   };
-}
-
-absl::StatusOr<mlir::stablehlo::CustomCallOp> CreateCustomCallOp(
-    mlir::OpBuilder& builder, mlir::Location loc, kiln::Kernel kernel,
-    mlir::ValueRange inputs, mlir::TypeRange output_types) {
-  TT_ASSIGN_OR_RETURN(std::string serialized_kernel,
-                      std::move(kernel).Serialize());
-
-  std::string backend_config_json = absl::StrFormat(
-      R"({
-        "custom_call_config": {
-          "body": "%s",
-          "needs_layout_passes": true,
-          "serialization_format": 1,
-        },
-        "device_type": "DEVICE_TYPE_TENSORCORE",
-        "scoped_memory_configs": [
-          {
-            "memory_space": 1,
-            "offset": 0,
-            "size": %d
-          }
-        ]
-      })",
-      absl::Base64Escape(serialized_kernel), GetDeviceVmemLimitBytes());
-
-  auto get_default_layout = [&builder](mlir::Type type) {
-    int64_t rank = mlir::cast<mlir::RankedTensorType>(type).getRank();
-    auto layout_range = llvm::reverse(llvm::seq(rank));
-    llvm::SmallVector<int64_t> layout(layout_range.begin(), layout_range.end());
-    auto layout_type =
-        mlir::RankedTensorType::get({rank}, builder.getIndexType());
-    return mlir::DenseIntElementsAttr::get(layout_type, layout);
-  };
-
-  llvm::SmallVector<mlir::Attribute> input_layouts;
-  input_layouts.reserve(inputs.size());
-  for (const auto& input : inputs) {
-    input_layouts.push_back(get_default_layout(input.getType()));
-  }
-
-  llvm::SmallVector<mlir::Attribute> output_layouts;
-  output_layouts.reserve(output_types.size());
-  for (const auto& output_type : output_types) {
-    output_layouts.push_back(get_default_layout(output_type));
-  }
-
-  return mlir::stablehlo::CustomCallOp::create(
-      builder, loc, output_types, inputs,
-      builder.getStringAttr("tpu_custom_call"), builder.getBoolAttr(false),
-      builder.getStringAttr(backend_config_json),
-      mlir::stablehlo::CustomCallApiVersionAttr::get(
-          builder.getContext(),
-          mlir::stablehlo::CustomCallApiVersion::API_VERSION_STATUS_RETURNING),
-      builder.getArrayAttr({}), builder.getArrayAttr(input_layouts),
-      builder.getArrayAttr(output_layouts),
-      /*output_operand_aliases=*/nullptr,
-      /*result_tilings=*/nullptr);
 }
 
 bool IsDefined(const std::optional<at::Tensor>& tensor) {
@@ -618,8 +554,9 @@ CreateFlashAttentionKernelImpl(const at::Tensor& query, const at::Tensor& key,
 
     TT_ASSIGN_OR_RETURN(
         auto custom_call,
-        CreateCustomCallOp(builder.getOpBuilder(), builder.getLoc(),
-                           std::move(kernel), operands, result_types));
+        CreateKilnCustomCallOp(builder.getOpBuilder(), builder.getLoc(),
+                               std::move(kernel), operands, result_types,
+                               GetDeviceVmemLimitBytes()));
 
     mlir::MlirOp out_padded(builder, custom_call.getResult(0));
     mlir::MlirOp out_sliced =
@@ -868,9 +805,9 @@ CreateFlashAttentionBackwardKernel(
     mlir::RankedTensorType value_type = GetTensorTypeOrDie(value_batch);
     TT_ASSIGN_OR_RETURN(
         auto dkv_custom_call,
-        CreateCustomCallOp(builder.getOpBuilder(), builder.getLoc(),
-                           std::move(dkv_kernel), dkv_inputs,
-                           {key_type, value_type}));
+        CreateKilnCustomCallOp(
+            builder.getOpBuilder(), builder.getLoc(), std::move(dkv_kernel),
+            dkv_inputs, {key_type, value_type}, GetDeviceVmemLimitBytes()));
 
     mlir::MlirOp out_batch =
         flatten_batch_dims(out_mlir, config.batch_size, rank - 3);
@@ -896,9 +833,9 @@ CreateFlashAttentionBackwardKernel(
                         CreateBackwardDqKernel(config, tiling));
     TT_ASSIGN_OR_RETURN(
         auto dq_custom_call,
-        CreateCustomCallOp(builder.getOpBuilder(), builder.getLoc(),
-                           std::move(dq_kernel), dq_inputs,
-                           {query_batch.getType()}));
+        CreateKilnCustomCallOp(
+            builder.getOpBuilder(), builder.getLoc(), std::move(dq_kernel),
+            dq_inputs, {query_batch.getType()}, GetDeviceVmemLimitBytes()));
 
     mlir::MlirOp grad_key_batch_padded(builder, dkv_custom_call.getResult(0));
     mlir::MlirOp grad_value_batch_padded(builder, dkv_custom_call.getResult(1));
