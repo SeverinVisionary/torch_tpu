@@ -1306,8 +1306,7 @@ torch_tpu_py_test(
     tags = [
         # Requires SparseCore accelerator, which is not available on TPU v5e and below.
         "fails-on-tpu-v5",
-        "ok-to-wait-for-v7x-in-presubmit",
-        "requires-tpu-v7x",
+        "requires-tpu-v5p",
     ],
     deps = [
         ":op_testing",
@@ -1328,8 +1327,7 @@ torch_tpu_py_test(
     tags = [
         # Requires SparseCore accelerator, which is not available on TPU v5e and below.
         "fails-on-tpu-v5",
-        "ok-to-wait-for-v7x-in-presubmit",
-        "requires-tpu-v7x",
+        "requires-tpu-v5p",
     ],
     deps = [
         ":op_testing",
