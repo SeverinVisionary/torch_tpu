@@ -289,5 +289,256 @@ module {
   EXPECT_EQ(max_reduce_count, 2);
 }
 
+TEST(PipelineTest, FusesManualFlashAttentionWhenScoreMatrixExceedsScopedVmem) {
+  static constexpr const char* kIr = R"mlir(
+module {
+  func.func @main(%q: tensor<16x1022x64xbf16>, %k_raw: tensor<1022x16x64xbf16>, %v: tensor<16x1022x64xbf16>) -> tensor<16x1022x64xbf16> {
+    %min_f32 = stablehlo.constant dense<0xFF7FFFFF> : tensor<f32>
+    %zero_f32 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %one_f32 = stablehlo.constant dense<1.000000e+00> : tensor<f32>
+    %kt = stablehlo.transpose %k_raw, dims = [1, 2, 0] : (tensor<1022x16x64xbf16>) -> tensor<16x64x1022xbf16>
+    %scores_bf16 = stablehlo.dot_general %q, %kt, batching_dims = [0] x [0], contracting_dims = [2] x [1] : (tensor<16x1022x64xbf16>, tensor<16x64x1022xbf16>) -> tensor<16x1022x1022xbf16>
+    %scores = stablehlo.convert %scores_bf16 : (tensor<16x1022x1022xbf16>) -> tensor<16x1022x1022xf32>
+    %max = stablehlo.reduce(%scores init: %min_f32) across dimensions = [2] : (tensor<16x1022x1022xf32>, tensor<f32>) -> tensor<16x1022xf32>
+     reducer(%lhs: tensor<f32>, %rhs: tensor<f32>) {
+      %m = stablehlo.maximum %lhs, %rhs : tensor<f32>
+      stablehlo.return %m : tensor<f32>
+    }
+    %max_3d = stablehlo.reshape %max : (tensor<16x1022xf32>) -> tensor<16x1022x1xf32>
+    %max_bcast1 = stablehlo.broadcast_in_dim %max_3d, dims = [0, 1, 2] : (tensor<16x1022x1xf32>) -> tensor<16x1022x1xf32>
+    %max_2d = stablehlo.reshape %max_bcast1 : (tensor<16x1022x1xf32>) -> tensor<16x1022xf32>
+    %max_bcast2 = stablehlo.broadcast_in_dim %max_2d, dims = [0, 1] : (tensor<16x1022xf32>) -> tensor<16x1022x1022xf32>
+    %shifted = stablehlo.subtract %scores, %max_bcast2 : tensor<16x1022x1022xf32>
+    %exp = stablehlo.exponential %shifted : tensor<16x1022x1022xf32>
+    %sum = stablehlo.reduce(%exp init: %zero_f32) across dimensions = [2] : (tensor<16x1022x1022xf32>, tensor<f32>) -> tensor<16x1022xf32>
+     reducer(%lhs: tensor<f32>, %rhs: tensor<f32>) {
+      %a = stablehlo.add %lhs, %rhs : tensor<f32>
+      stablehlo.return %a : tensor<f32>
+    }
+    %sum_3d = stablehlo.reshape %sum : (tensor<16x1022xf32>) -> tensor<16x1022x1xf32>
+    %one_3d = stablehlo.broadcast_in_dim %one_f32, dims = [] : (tensor<f32>) -> tensor<16x1022x1xf32>
+    %inv_sum = stablehlo.divide %one_3d, %sum_3d : tensor<16x1022x1xf32>
+    %inv_bcast1 = stablehlo.broadcast_in_dim %inv_sum, dims = [0, 1, 2] : (tensor<16x1022x1xf32>) -> tensor<16x1022x1xf32>
+    %inv_2d = stablehlo.reshape %inv_bcast1 : (tensor<16x1022x1xf32>) -> tensor<16x1022xf32>
+    %inv_bcast2 = stablehlo.broadcast_in_dim %inv_2d, dims = [0, 1] : (tensor<16x1022xf32>) -> tensor<16x1022x1022xf32>
+    %probs_f32 = stablehlo.multiply %exp, %inv_bcast2 : tensor<16x1022x1022xf32>
+    %probs = stablehlo.convert %probs_f32 : (tensor<16x1022x1022xf32>) -> tensor<16x1022x1022xbf16>
+    %out = stablehlo.dot_general %probs, %v, batching_dims = [0] x [0], contracting_dims = [2] x [1] : (tensor<16x1022x1022xbf16>, tensor<16x1022x64xbf16>) -> tensor<16x1022x64xbf16>
+    return %out : tensor<16x1022x64xbf16>
+  }
+}
+)mlir";
+
+  mlir::DialectRegistry registry;
+  mlir::stablehlo::registerAllDialects(registry);
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(kIr, &context);
+  ASSERT_TRUE(module);
+
+  ASSERT_THAT(RunTorchTpuOptimizationPasses(*module, &context), IsOk());
+
+  int dot_count = 0;
+  int custom_call_count = 0;
+  module->walk([&](mlir::Operation* op) {
+    if (mlir::isa<mlir::stablehlo::DotGeneralOp>(op)) {
+      ++dot_count;
+    }
+    if (auto cc = mlir::dyn_cast<mlir::stablehlo::CustomCallOp>(op)) {
+      if (cc.getCallTargetName() == "tpu_custom_call") {
+        ++custom_call_count;
+      }
+    }
+  });
+  EXPECT_EQ(dot_count, 0);
+  EXPECT_EQ(custom_call_count, 1);
+}
+
+TEST(PipelineTest, Fuses4dScaledMaskedManualFlashAttention) {
+  static constexpr const char* kIr = R"mlir(
+module {
+  func.func @main(%q: tensor<12x901x64xbf16>, %k_proj: tensor<901x768xbf16>, %v: tensor<1x12x901x64xbf16>, %mask: tensor<1x1x901x901xbf16>) -> (tensor<12x901x64xbf16>, tensor<1x12x901x64xbf16>) {
+    %eight_bf16 = stablehlo.constant dense<8.000000e+00> : tensor<bf16>
+    %min_f32 = stablehlo.constant dense<0xFF7FFFFF> : tensor<f32>
+    %zero_f32 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %one_f32 = stablehlo.constant dense<1.000000e+00> : tensor<f32>
+    %k_r4d = stablehlo.reshape %k_proj : (tensor<901x768xbf16>) -> tensor<901x12x64x1xbf16>
+    %k_4d = stablehlo.transpose %k_r4d, dims = [3, 1, 0, 2] : (tensor<901x12x64x1xbf16>) -> tensor<1x12x901x64xbf16>
+    %k_3d = stablehlo.reshape %k_4d : (tensor<1x12x901x64xbf16>) -> tensor<12x901x64xbf16>
+    %kt = stablehlo.transpose %k_3d, dims = [0, 2, 1] : (tensor<12x901x64xbf16>) -> tensor<12x64x901xbf16>
+    %bmm1 = stablehlo.dot_general %q, %kt, batching_dims = [0] x [0], contracting_dims = [2] x [1] : (tensor<12x901x64xbf16>, tensor<12x64x901xbf16>) -> tensor<12x901x901xbf16>
+    %bmm1_4d = stablehlo.reshape %bmm1 : (tensor<12x901x901xbf16>) -> tensor<1x12x901x901xbf16>
+    %eight_4d = stablehlo.broadcast_in_dim %eight_bf16, dims = [] : (tensor<bf16>) -> tensor<1x12x901x901xbf16>
+    %scaled = stablehlo.divide %bmm1_4d, %eight_4d : tensor<1x12x901x901xbf16>
+    %mask_3d = stablehlo.reshape %mask : (tensor<1x1x901x901xbf16>) -> tensor<1x901x901xbf16>
+    %mask_4d = stablehlo.broadcast_in_dim %mask_3d, dims = [0, 2, 3] : (tensor<1x901x901xbf16>) -> tensor<1x12x901x901xbf16>
+    %biased = stablehlo.add %scaled, %mask_4d : tensor<1x12x901x901xbf16>
+    %scores = stablehlo.convert %biased : (tensor<1x12x901x901xbf16>) -> tensor<1x12x901x901xf32>
+    %max = stablehlo.reduce(%scores init: %min_f32) across dimensions = [3] : (tensor<1x12x901x901xf32>, tensor<f32>) -> tensor<1x12x901xf32>
+     reducer(%lhs: tensor<f32>, %rhs: tensor<f32>) {
+      %m = stablehlo.maximum %lhs, %rhs : tensor<f32>
+      stablehlo.return %m : tensor<f32>
+    }
+    %max_bcast = stablehlo.broadcast_in_dim %max, dims = [0, 1, 2] : (tensor<1x12x901xf32>) -> tensor<1x12x901x901xf32>
+    %shifted = stablehlo.subtract %scores, %max_bcast : tensor<1x12x901x901xf32>
+    %exp = stablehlo.exponential %shifted : tensor<1x12x901x901xf32>
+    %sum = stablehlo.reduce(%exp init: %zero_f32) across dimensions = [3] : (tensor<1x12x901x901xf32>, tensor<f32>) -> tensor<1x12x901xf32>
+     reducer(%lhs: tensor<f32>, %rhs: tensor<f32>) {
+      %a = stablehlo.add %lhs, %rhs : tensor<f32>
+      stablehlo.return %a : tensor<f32>
+    }
+    %sum_bcast = stablehlo.broadcast_in_dim %sum, dims = [0, 1, 2] : (tensor<1x12x901xf32>) -> tensor<1x12x901x901xf32>
+    %probs_f32 = stablehlo.divide %exp, %sum_bcast : tensor<1x12x901x901xf32>
+    %probs_4d = stablehlo.convert %probs_f32 : (tensor<1x12x901x901xf32>) -> tensor<1x12x901x901xbf16>
+    %probs_3d = stablehlo.reshape %probs_4d : (tensor<1x12x901x901xbf16>) -> tensor<12x901x901xbf16>
+    %v_3d = stablehlo.reshape %v : (tensor<1x12x901x64xbf16>) -> tensor<12x901x64xbf16>
+    %out = stablehlo.dot_general %probs_3d, %v_3d, batching_dims = [0] x [0], contracting_dims = [2] x [1] : (tensor<12x901x901xbf16>, tensor<12x901x64xbf16>) -> tensor<12x901x64xbf16>
+    return %out, %k_4d : tensor<12x901x64xbf16>, tensor<1x12x901x64xbf16>
+  }
+}
+)mlir";
+
+  mlir::DialectRegistry registry;
+  mlir::stablehlo::registerAllDialects(registry);
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(kIr, &context);
+  ASSERT_TRUE(module);
+
+  ASSERT_THAT(RunTorchTpuOptimizationPasses(*module, &context), IsOk());
+
+  int dot_count = 0;
+  int custom_call_count = 0;
+  int custom_call_operands = 0;
+  module->walk([&](mlir::Operation* op) {
+    if (mlir::isa<mlir::stablehlo::DotGeneralOp>(op)) {
+      ++dot_count;
+    }
+    if (auto cc = mlir::dyn_cast<mlir::stablehlo::CustomCallOp>(op)) {
+      if (cc.getCallTargetName() == "tpu_custom_call") {
+        ++custom_call_count;
+        custom_call_operands = cc.getNumOperands();
+      }
+    }
+  });
+  EXPECT_EQ(dot_count, 0);
+  EXPECT_EQ(custom_call_count, 1);
+  EXPECT_EQ(custom_call_operands, 4);
+}
+
+TEST(PipelineTest, DoesNotFuseManualAttentionWhenScoreMatrixFitsInScopedVmem) {
+  static constexpr const char* kIr = R"mlir(
+module {
+  func.func @main(%q: tensor<12x197x64xbf16>, %kt: tensor<12x64x197xbf16>, %v: tensor<12x197x64xbf16>) -> tensor<12x197x64xbf16> {
+    %min_f32 = stablehlo.constant dense<0xFF7FFFFF> : tensor<f32>
+    %zero_f32 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %bmm1 = stablehlo.dot_general %q, %kt, batching_dims = [0] x [0], contracting_dims = [2] x [1] : (tensor<12x197x64xbf16>, tensor<12x64x197xbf16>) -> tensor<12x197x197xbf16>
+    %scores = stablehlo.convert %bmm1 : (tensor<12x197x197xbf16>) -> tensor<12x197x197xf32>
+    %max = stablehlo.reduce(%scores init: %min_f32) across dimensions = [2] : (tensor<12x197x197xf32>, tensor<f32>) -> tensor<12x197xf32>
+     reducer(%lhs: tensor<f32>, %rhs: tensor<f32>) {
+      %m = stablehlo.maximum %lhs, %rhs : tensor<f32>
+      stablehlo.return %m : tensor<f32>
+    }
+    %max_bcast = stablehlo.broadcast_in_dim %max, dims = [0, 1] : (tensor<12x197xf32>) -> tensor<12x197x197xf32>
+    %shifted = stablehlo.subtract %scores, %max_bcast : tensor<12x197x197xf32>
+    %exp = stablehlo.exponential %shifted : tensor<12x197x197xf32>
+    %sum = stablehlo.reduce(%exp init: %zero_f32) across dimensions = [2] : (tensor<12x197x197xf32>, tensor<f32>) -> tensor<12x197xf32>
+     reducer(%lhs: tensor<f32>, %rhs: tensor<f32>) {
+      %a = stablehlo.add %lhs, %rhs : tensor<f32>
+      stablehlo.return %a : tensor<f32>
+    }
+    %sum_bcast = stablehlo.broadcast_in_dim %sum, dims = [0, 1] : (tensor<12x197xf32>) -> tensor<12x197x197xf32>
+    %probs_f32 = stablehlo.divide %exp, %sum_bcast : tensor<12x197x197xf32>
+    %probs = stablehlo.convert %probs_f32 : (tensor<12x197x197xf32>) -> tensor<12x197x197xbf16>
+    %out = stablehlo.dot_general %probs, %v, batching_dims = [0] x [0], contracting_dims = [2] x [1] : (tensor<12x197x197xbf16>, tensor<12x197x64xbf16>) -> tensor<12x197x64xbf16>
+    return %out : tensor<12x197x64xbf16>
+  }
+}
+)mlir";
+
+  mlir::DialectRegistry registry;
+  mlir::stablehlo::registerAllDialects(registry);
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(kIr, &context);
+  ASSERT_TRUE(module);
+
+  ASSERT_THAT(RunTorchTpuOptimizationPasses(*module, &context), IsOk());
+
+  int dot_count = 0;
+  int custom_call_count = 0;
+  module->walk([&](mlir::Operation* op) {
+    if (mlir::isa<mlir::stablehlo::DotGeneralOp>(op)) {
+      ++dot_count;
+    }
+    if (mlir::isa<mlir::stablehlo::CustomCallOp>(op)) {
+      ++custom_call_count;
+    }
+  });
+  EXPECT_EQ(dot_count, 2);
+  EXPECT_EQ(custom_call_count, 0);
+}
+
+TEST(PipelineTest, FusesManualFlashAttentionF32) {
+  static constexpr const char* kIr = R"mlir(
+module {
+  func.func @main(%q: tensor<16x1022x64xf32>, %kt: tensor<16x64x1022xf32>, %v: tensor<16x1022x64xf32>) -> tensor<16x1022x64xf32> {
+    %min_f32 = stablehlo.constant dense<0xFF7FFFFF> : tensor<f32>
+    %zero_f32 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %scores = stablehlo.dot_general %q, %kt, batching_dims = [0] x [0], contracting_dims = [2] x [1] : (tensor<16x1022x64xf32>, tensor<16x64x1022xf32>) -> tensor<16x1022x1022xf32>
+    %max = stablehlo.reduce(%scores init: %min_f32) across dimensions = [2] : (tensor<16x1022x1022xf32>, tensor<f32>) -> tensor<16x1022xf32>
+     reducer(%lhs: tensor<f32>, %rhs: tensor<f32>) {
+      %m = stablehlo.maximum %lhs, %rhs : tensor<f32>
+      stablehlo.return %m : tensor<f32>
+    }
+    %max_bcast = stablehlo.broadcast_in_dim %max, dims = [0, 1] : (tensor<16x1022xf32>) -> tensor<16x1022x1022xf32>
+    %shifted = stablehlo.subtract %scores, %max_bcast : tensor<16x1022x1022xf32>
+    %exp = stablehlo.exponential %shifted : tensor<16x1022x1022xf32>
+    %sum = stablehlo.reduce(%exp init: %zero_f32) across dimensions = [2] : (tensor<16x1022x1022xf32>, tensor<f32>) -> tensor<16x1022xf32>
+     reducer(%lhs: tensor<f32>, %rhs: tensor<f32>) {
+      %a = stablehlo.add %lhs, %rhs : tensor<f32>
+      stablehlo.return %a : tensor<f32>
+    }
+    %sum_bcast = stablehlo.broadcast_in_dim %sum, dims = [0, 1] : (tensor<16x1022xf32>) -> tensor<16x1022x1022xf32>
+    %probs = stablehlo.divide %exp, %sum_bcast : tensor<16x1022x1022xf32>
+    %out = stablehlo.dot_general %probs, %v, batching_dims = [0] x [0], contracting_dims = [2] x [1] : (tensor<16x1022x1022xf32>, tensor<16x1022x64xf32>) -> tensor<16x1022x64xf32>
+    return %out : tensor<16x1022x64xf32>
+  }
+}
+)mlir";
+
+  mlir::DialectRegistry registry;
+  mlir::stablehlo::registerAllDialects(registry);
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(kIr, &context);
+  ASSERT_TRUE(module);
+
+  ASSERT_THAT(RunTorchTpuOptimizationPasses(*module, &context), IsOk());
+
+  int dot_count = 0;
+  int custom_call_count = 0;
+  module->walk([&](mlir::Operation* op) {
+    if (mlir::isa<mlir::stablehlo::DotGeneralOp>(op)) {
+      ++dot_count;
+    }
+    if (auto cc = mlir::dyn_cast<mlir::stablehlo::CustomCallOp>(op)) {
+      if (cc.getCallTargetName() == "tpu_custom_call") {
+        ++custom_call_count;
+      }
+    }
+  });
+  EXPECT_EQ(dot_count, 0);
+  EXPECT_EQ(custom_call_count, 1);
+}
+
 }  // namespace
 }  // namespace torch_tpu

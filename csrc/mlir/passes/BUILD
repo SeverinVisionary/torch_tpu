@@ -56,6 +56,29 @@ torch_tpu_cc_library(
 )
 
 torch_tpu_cc_library(
+    name = "fuse_manual_flash_attention",
+    srcs = ["fuse_manual_flash_attention.cc"],
+    hdrs = ["fuse_manual_flash_attention.h"],
+    deps = [
+        "//csrc/internal/mosaic/kiln",
+        "//csrc/ops/scaled_dot_product_attention:flash_attention_config",
+        "//csrc/ops/scaled_dot_product_attention:flash_attention_kernel",
+        "//csrc/ops/scaled_dot_product_attention:util",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Pass",
+        "@llvm-project//mlir:SideEffectInterfaces",
+        "@llvm-project//mlir:Support",
+        "@stablehlo//:stablehlo_ops",
+        "@stablehlo//stablehlo/integrations/cpp/builder:attr_type_builder_util",
+    ],
+)
+
+torch_tpu_cc_library(
     name = "lower_separable_gather_to_dot",
     srcs = ["lower_separable_gather_to_dot.cc"],
     hdrs = ["lower_separable_gather_to_dot.h"],
