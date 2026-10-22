@@ -49,7 +49,9 @@ torch_tpu_cc_test(
     srcs = ["kiln_test.cc"],
     deps = [
         ":kiln",
+        "//csrc/common:error_utils",
         "//csrc/common:oss_test_main",
+        "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
