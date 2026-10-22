@@ -91,6 +91,21 @@ torch_tpu_cc_test(
 )
 
 torch_tpu_cc_library(
+    name = "propagate_custom_call_output_layouts",
+    srcs = ["propagate_custom_call_output_layouts.cc"],
+    hdrs = ["propagate_custom_call_output_layouts.h"],
+    deps = [
+        "@com_google_absl//absl/strings",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Pass",
+        "@llvm-project//mlir:Support",
+        "@stablehlo//:stablehlo_ops",
+    ],
+)
+
+torch_tpu_cc_library(
     name = "reassociate_norm_weights",
     srcs = ["reassociate_norm_weights.cc"],
     hdrs = ["reassociate_norm_weights.h"],

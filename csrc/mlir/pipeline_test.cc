@@ -289,5 +289,296 @@ module {
   EXPECT_EQ(max_reduce_count, 2);
 }
 
+TEST(PipelineTest,
+     PropagatesCustomCallOutputLayoutAndCanonicalizesUnitBatchTranspose) {
+  static constexpr const char* kIr = R"mlir(
+module {
+  func.func @main(%q: tensor<1x12x512x64xbf16>, %kv_proj: tensor<512x768xbf16>) -> (tensor<1x12x512x64xbf16>, tensor<1x12x512x64xbf16>) {
+    %r4d = stablehlo.reshape %kv_proj : (tensor<512x768xbf16>) -> tensor<512x12x64x1xbf16>
+    %kv = stablehlo.transpose %r4d, dims = [3, 1, 0, 2] : (tensor<512x12x64x1xbf16>) -> tensor<1x12x512x64xbf16>
+    %attn = stablehlo.custom_call @tpu_custom_call(%q, %kv, %kv) {
+      api_version = 2 : i32,
+      backend_config = "{}",
+      has_side_effect = false,
+      operand_layouts = [
+        dense<[3, 2, 1, 0]> : tensor<4xindex>,
+        dense<[3, 2, 1, 0]> : tensor<4xindex>,
+        dense<[3, 2, 1, 0]> : tensor<4xindex>
+      ],
+      result_layouts = [dense<[3, 2, 1, 0]> : tensor<4xindex>]
+    } : (tensor<1x12x512x64xbf16>, tensor<1x12x512x64xbf16>, tensor<1x12x512x64xbf16>) -> tensor<1x12x512x64xbf16>
+    return %attn, %kv : tensor<1x12x512x64xbf16>, tensor<1x12x512x64xbf16>
+  }
+}
+)mlir";
+
+  mlir::DialectRegistry registry;
+  mlir::stablehlo::registerAllDialects(registry);
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(kIr, &context);
+  ASSERT_TRUE(module);
+
+  EXPECT_THAT(RunTorchTpuOptimizationPasses(*module, &context), IsOk());
+
+  mlir::func::FuncOp main_fn = module->lookupSymbol<mlir::func::FuncOp>("main");
+  ASSERT_TRUE(main_fn);
+  EXPECT_EQ(main_fn.getResultAttr(0, "mhlo.layout_mode"), nullptr);
+  auto layout_attr =
+      main_fn.getResultAttrOfType<mlir::StringAttr>(1, "mhlo.layout_mode");
+  ASSERT_NE(layout_attr, nullptr);
+  EXPECT_EQ(layout_attr.getValue(), "{3,2,1,0}");
+
+  mlir::stablehlo::TransposeOp transpose_3d = nullptr;
+  int transpose_3d_count = 0;
+  int transpose_4d_count = 0;
+  module->walk([&](mlir::stablehlo::TransposeOp op) {
+    auto rank = mlir::cast<mlir::RankedTensorType>(op.getType()).getRank();
+    if (rank == 3) {
+      ++transpose_3d_count;
+      transpose_3d = op;
+    } else if (rank == 4) {
+      ++transpose_4d_count;
+    }
+  });
+  EXPECT_EQ(transpose_3d_count, 1);
+  EXPECT_EQ(transpose_4d_count, 0);
+  ASSERT_NE(transpose_3d, nullptr);
+  EXPECT_EQ(transpose_3d.getPermutation(), llvm::ArrayRef<int64_t>({1, 0, 2}));
+  auto t3d_type = mlir::cast<mlir::RankedTensorType>(transpose_3d.getType());
+  EXPECT_EQ(t3d_type.getShape(), llvm::ArrayRef<int64_t>({12, 512, 64}));
+
+  auto reshape_3d =
+      transpose_3d.getOperand().getDefiningOp<mlir::stablehlo::ReshapeOp>();
+  ASSERT_NE(reshape_3d, nullptr);
+  auto r3d_type = mlir::cast<mlir::RankedTensorType>(reshape_3d.getType());
+  EXPECT_EQ(r3d_type.getShape(), llvm::ArrayRef<int64_t>({512, 12, 64}));
+  EXPECT_EQ(reshape_3d.getOperand(), main_fn.getArgument(1));
+
+  auto return_op = mlir::cast<mlir::func::ReturnOp>(
+      main_fn.getBody().front().getTerminator());
+  mlir::Value ret1 = return_op.getOperand(1);
+  auto reshape_4d = ret1.getDefiningOp<mlir::stablehlo::ReshapeOp>();
+  ASSERT_NE(reshape_4d, nullptr);
+  EXPECT_EQ(reshape_4d.getOperand(), transpose_3d.getResult());
+  auto r4d_type = mlir::cast<mlir::RankedTensorType>(reshape_4d.getType());
+  EXPECT_EQ(r4d_type.getShape(), llvm::ArrayRef<int64_t>({1, 12, 512, 64}));
+
+  mlir::stablehlo::CustomCallOp custom_call = nullptr;
+  module->walk([&](mlir::stablehlo::CustomCallOp op) { custom_call = op; });
+  ASSERT_NE(custom_call, nullptr);
+  EXPECT_EQ(custom_call.getOperand(1), ret1);
+  EXPECT_EQ(custom_call.getOperand(2), ret1);
+}
+
+TEST(PipelineTest, PropagatesCustomCallOutputLayoutWhenLseReturnedForBackward) {
+  static constexpr const char* kIr = R"mlir(
+module {
+  func.func @main(%q: tensor<1x12x512x64xbf16>, %kv_proj: tensor<512x768xbf16>) -> (tensor<1x12x512x64xbf16>, tensor<1x12x512x64xbf16>) {
+    %r4d = stablehlo.reshape %kv_proj : (tensor<512x768xbf16>) -> tensor<512x12x64x1xbf16>
+    %kv = stablehlo.transpose %r4d, dims = [3, 1, 0, 2] : (tensor<512x12x64x1xbf16>) -> tensor<1x12x512x64xbf16>
+    %attn:2 = stablehlo.custom_call @tpu_custom_call(%q, %kv, %kv) {
+      api_version = 2 : i32,
+      backend_config = "{}",
+      has_side_effect = false,
+      operand_layouts = [
+        dense<[3, 2, 1, 0]> : tensor<4xindex>,
+        dense<[3, 2, 1, 0]> : tensor<4xindex>,
+        dense<[3, 2, 1, 0]> : tensor<4xindex>
+      ],
+      result_layouts = [
+        dense<[3, 2, 1, 0]> : tensor<4xindex>,
+        dense<[3, 2, 1, 0]> : tensor<4xindex>
+      ]
+    } : (tensor<1x12x512x64xbf16>, tensor<1x12x512x64xbf16>, tensor<1x12x512x64xbf16>) -> (tensor<1x12x512x64xbf16>, tensor<1x12x1x512xf32>)
+    return %attn#0, %kv : tensor<1x12x512x64xbf16>, tensor<1x12x512x64xbf16>
+  }
+}
+)mlir";
+
+  mlir::DialectRegistry registry;
+  mlir::stablehlo::registerAllDialects(registry);
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(kIr, &context);
+  ASSERT_TRUE(module);
+
+  EXPECT_THAT(RunTorchTpuOptimizationPasses(*module, &context), IsOk());
+
+  mlir::func::FuncOp main_fn = module->lookupSymbol<mlir::func::FuncOp>("main");
+  ASSERT_TRUE(main_fn);
+  EXPECT_EQ(main_fn.getResultAttr(0, "mhlo.layout_mode"), nullptr);
+  auto layout_attr =
+      main_fn.getResultAttrOfType<mlir::StringAttr>(1, "mhlo.layout_mode");
+  ASSERT_NE(layout_attr, nullptr);
+  EXPECT_EQ(layout_attr.getValue(), "{3,2,1,0}");
+}
+
+TEST(PipelineTest, PropagatesCustomCallOutputLayoutThroughPadOp) {
+  static constexpr const char* kIr = R"mlir(
+module {
+  func.func @main(%q: tensor<1x12x512x64xbf16>, %kv: tensor<1x12x512x64xbf16>) -> (tensor<1x12x512x64xbf16>, tensor<1x12x512x64xbf16>) {
+    %c0 = stablehlo.constant dense<0.0> : tensor<bf16>
+    %padded = stablehlo.pad %kv, %c0, low = [0, 0, 0, 0], high = [0, 0, 0, 0], interior = [0, 0, 0, 0] : (tensor<1x12x512x64xbf16>, tensor<bf16>) -> tensor<1x12x512x64xbf16>
+    %attn = stablehlo.custom_call @tpu_custom_call(%q, %padded, %padded) {
+      api_version = 2 : i32,
+      backend_config = "{}",
+      has_side_effect = false,
+      operand_layouts = [
+        dense<[3, 2, 1, 0]> : tensor<4xindex>,
+        dense<[3, 2, 1, 0]> : tensor<4xindex>,
+        dense<[3, 2, 1, 0]> : tensor<4xindex>
+      ],
+      result_layouts = [dense<[3, 2, 1, 0]> : tensor<4xindex>]
+    } : (tensor<1x12x512x64xbf16>, tensor<1x12x512x64xbf16>, tensor<1x12x512x64xbf16>) -> tensor<1x12x512x64xbf16>
+    return %attn, %kv : tensor<1x12x512x64xbf16>, tensor<1x12x512x64xbf16>
+  }
+}
+)mlir";
+
+  mlir::DialectRegistry registry;
+  mlir::stablehlo::registerAllDialects(registry);
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(kIr, &context);
+  ASSERT_TRUE(module);
+
+  EXPECT_THAT(RunTorchTpuOptimizationPasses(*module, &context), IsOk());
+
+  mlir::func::FuncOp main_fn = module->lookupSymbol<mlir::func::FuncOp>("main");
+  ASSERT_TRUE(main_fn);
+  EXPECT_EQ(main_fn.getResultAttr(0, "mhlo.layout_mode"), nullptr);
+  auto layout_attr =
+      main_fn.getResultAttrOfType<mlir::StringAttr>(1, "mhlo.layout_mode");
+  ASSERT_NE(layout_attr, nullptr);
+  EXPECT_EQ(layout_attr.getValue(), "{3,2,1,0}");
+}
+
+TEST(PipelineTest,
+     DoesNotAbortLayoutPropagationWhenFunctionReturnsBlockArgument) {
+  static constexpr const char* kIr = R"mlir(
+module {
+  func.func @main(%passthrough: tensor<1xi32>, %q: tensor<1x12x512x64xbf16>, %kv_proj: tensor<512x768xbf16>) -> (tensor<1xi32>, tensor<1x12x512x64xbf16>, tensor<1x12x512x64xbf16>) {
+    %r4d = stablehlo.reshape %kv_proj : (tensor<512x768xbf16>) -> tensor<512x12x64x1xbf16>
+    %kv = stablehlo.transpose %r4d, dims = [3, 1, 0, 2] : (tensor<512x12x64x1xbf16>) -> tensor<1x12x512x64xbf16>
+    %attn = stablehlo.custom_call @tpu_custom_call(%q, %kv, %kv) {
+      api_version = 2 : i32,
+      backend_config = "{}",
+      has_side_effect = false,
+      operand_layouts = [
+        dense<[3, 2, 1, 0]> : tensor<4xindex>,
+        dense<[3, 2, 1, 0]> : tensor<4xindex>,
+        dense<[3, 2, 1, 0]> : tensor<4xindex>
+      ],
+      result_layouts = [dense<[3, 2, 1, 0]> : tensor<4xindex>]
+    } : (tensor<1x12x512x64xbf16>, tensor<1x12x512x64xbf16>, tensor<1x12x512x64xbf16>) -> tensor<1x12x512x64xbf16>
+    return %passthrough, %attn, %kv : tensor<1xi32>, tensor<1x12x512x64xbf16>, tensor<1x12x512x64xbf16>
+  }
+}
+)mlir";
+
+  mlir::DialectRegistry registry;
+  mlir::stablehlo::registerAllDialects(registry);
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(kIr, &context);
+  ASSERT_TRUE(module);
+
+  EXPECT_THAT(RunTorchTpuOptimizationPasses(*module, &context), IsOk());
+
+  mlir::func::FuncOp main_fn = module->lookupSymbol<mlir::func::FuncOp>("main");
+  ASSERT_TRUE(main_fn);
+  EXPECT_EQ(main_fn.getResultAttr(0, "mhlo.layout_mode"), nullptr);
+  EXPECT_EQ(main_fn.getResultAttr(1, "mhlo.layout_mode"), nullptr);
+  auto layout_attr =
+      main_fn.getResultAttrOfType<mlir::StringAttr>(2, "mhlo.layout_mode");
+  ASSERT_NE(layout_attr, nullptr);
+  EXPECT_EQ(layout_attr.getValue(), "{3,2,1,0}");
+}
+
+TEST(PipelineTest, PropagatesNonDefaultCustomCallOperandLayout) {
+  static constexpr const char* kIr = R"mlir(
+module {
+  func.func @main(%q: tensor<1x12x512x64xbf16>, %kv: tensor<1x12x512x64xbf16>) -> (tensor<1x12x512x64xbf16>, tensor<1x12x512x64xbf16>) {
+    %attn = stablehlo.custom_call @tpu_custom_call(%q, %kv, %kv) {
+      api_version = 2 : i32,
+      backend_config = "{}",
+      has_side_effect = false,
+      operand_layouts = [
+        dense<[0, 1, 2, 3]> : tensor<4xindex>,
+        dense<[0, 1, 2, 3]> : tensor<4xindex>,
+        dense<[0, 1, 2, 3]> : tensor<4xindex>
+      ],
+      result_layouts = [dense<[0, 1, 2, 3]> : tensor<4xindex>]
+    } : (tensor<1x12x512x64xbf16>, tensor<1x12x512x64xbf16>, tensor<1x12x512x64xbf16>) -> tensor<1x12x512x64xbf16>
+    return %attn, %kv : tensor<1x12x512x64xbf16>, tensor<1x12x512x64xbf16>
+  }
+}
+)mlir";
+
+  mlir::DialectRegistry registry;
+  mlir::stablehlo::registerAllDialects(registry);
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(kIr, &context);
+  ASSERT_TRUE(module);
+
+  EXPECT_THAT(RunTorchTpuOptimizationPasses(*module, &context), IsOk());
+
+  mlir::func::FuncOp main_fn = module->lookupSymbol<mlir::func::FuncOp>("main");
+  ASSERT_TRUE(main_fn);
+  auto layout_attr =
+      main_fn.getResultAttrOfType<mlir::StringAttr>(1, "mhlo.layout_mode");
+  ASSERT_NE(layout_attr, nullptr);
+  EXPECT_EQ(layout_attr.getValue(), "{0,1,2,3}");
+}
+
+TEST(PipelineTest, CanonicalizesUnitBatchTransposeInIntermediateLayer) {
+  static constexpr const char* kIr = R"mlir(
+module {
+  func.func @main(%x: tensor<1x12x512x64xbf16>, %kv_proj: tensor<512x768xbf16>) -> tensor<1x12x512x64xbf16> {
+    %r4d = stablehlo.reshape %kv_proj : (tensor<512x768xbf16>) -> tensor<512x12x64x1xbf16>
+    %kv = stablehlo.transpose %r4d, dims = [3, 1, 0, 2] : (tensor<512x12x64x1xbf16>) -> tensor<1x12x512x64xbf16>
+    %out = stablehlo.add %x, %kv : tensor<1x12x512x64xbf16>
+    return %out : tensor<1x12x512x64xbf16>
+  }
+}
+)mlir";
+
+  mlir::DialectRegistry registry;
+  mlir::stablehlo::registerAllDialects(registry);
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(kIr, &context);
+  ASSERT_TRUE(module);
+
+  EXPECT_THAT(RunTorchTpuOptimizationPasses(*module, &context), IsOk());
+
+  int transpose_3d_count = 0;
+  int transpose_4d_count = 0;
+  module->walk([&](mlir::stablehlo::TransposeOp op) {
+    auto rank = mlir::cast<mlir::RankedTensorType>(op.getType()).getRank();
+    if (rank == 3) {
+      ++transpose_3d_count;
+    } else if (rank == 4) {
+      ++transpose_4d_count;
+    }
+  });
+  EXPECT_EQ(transpose_3d_count, 1);
+  EXPECT_EQ(transpose_4d_count, 0);
+}
+
 }  // namespace
 }  // namespace torch_tpu
