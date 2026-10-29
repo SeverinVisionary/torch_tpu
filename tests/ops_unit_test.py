@@ -23833,9 +23833,9 @@ class OpTestingFrameworkTest(op_testing.OpInfoTestBase):
       self.assert_close_tpu_vs_cpu(compute_f32_c64)
 
   @parameterized.product(
-    dtype=[torch.bfloat16, torch.float16],
-    use_compiled=[False, True],
-    size=[1, 33, 129],
+      dtype=[torch.bfloat16, torch.float16],
+      use_compiled=[False, True],
+      size=[1, 33, 129],
   )
   def test_alpha_opmath_add(self, dtype, use_compiled, size):
     def add_variants(x, y, alpha):
@@ -23844,29 +23844,31 @@ class OpTestingFrameworkTest(op_testing.OpInfoTestBase):
       foreach_inplace = [x.clone()]
       torch._foreach_add_(foreach_inplace, [y], alpha=alpha)
       return (
-        torch.add(x, y, alpha=alpha),
-        torch.ops.aten.add.Tensor(x, y, alpha=alpha),
-        x.clone().add_(y, alpha=alpha),
-        out,
-        torch._foreach_add([x], [y], alpha=alpha)[0],
-        foreach_inplace[0],
+          torch.add(x, y, alpha=alpha),
+          torch.ops.aten.add.Tensor(x, y, alpha=alpha),
+          x.clone().add_(y, alpha=alpha),
+          out,
+          torch._foreach_add([x], [y], alpha=alpha)[0],
+          foreach_inplace[0],
       )
 
     kernel = (
-      torch.compile(add_variants, backend="tpu", fullgraph=True, dynamic=False)
-      if use_compiled
-      else add_variants
+        torch.compile(
+            add_variants, backend="tpu", fullgraph=True, dynamic=False
+        )
+        if use_compiled
+        else add_variants
     )
     cases = [
-      # Alpha rounding near cancellation, then an exact-alpha multiply.
-      (0.1, 0.052978515625, -0.53125),
-      (
-        1.5,
-        -1.0,
-        0.66796875 if dtype == torch.bfloat16 else 0.66650390625,
-      ),
-      # Alpha exceeds fp16's range but the result is finite.
-      (65536.0, 1.0, 0.0009765625),
+        # Alpha rounding near cancellation, then an exact-alpha multiply.
+        (0.1, 0.052978515625, -0.53125),
+        (
+            1.5,
+            -1.0,
+            0.66796875 if dtype == torch.bfloat16 else 0.66650390625,
+        ),
+        # Alpha exceeds fp16's range but the result is finite.
+        (65536.0, 1.0, 0.0009765625),
     ]
     for alpha, x_value, y_value in cases:
       with self.subTest(alpha=alpha):
@@ -23879,8 +23881,8 @@ class OpTestingFrameworkTest(op_testing.OpInfoTestBase):
           utils.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
   @parameterized.product(
-    dtype=[torch.bfloat16, torch.float16],
-    use_compiled=[False, True],
+      dtype=[torch.bfloat16, torch.float16],
+      use_compiled=[False, True],
   )
   def test_alpha_opmath_sub_add_relu(self, dtype, use_compiled):
     alpha = 0.1
@@ -23891,21 +23893,21 @@ class OpTestingFrameworkTest(op_testing.OpInfoTestBase):
       relu_out = torch.empty_like(x)
       torch.ops.aten._add_relu.out(-x, y, alpha=alpha, out=relu_out)
       return (
-        torch.sub(x, y, alpha=alpha),
-        x.clone().sub_(y, alpha=alpha),
-        sub_out,
-        torch.rsub(y, x, alpha=alpha),
-        torch.ops.aten._add_relu.Tensor(-x, y, alpha=alpha),
-        torch.ops.aten._add_relu_.Tensor(-x, y, alpha=alpha),
-        relu_out,
-        torch.ops.aten._add_relu.Scalar(-x, 0.53125, alpha=alpha),
-        torch.ops.aten._add_relu_.Scalar(-x, 0.53125, alpha=alpha),
+          torch.sub(x, y, alpha=alpha),
+          x.clone().sub_(y, alpha=alpha),
+          sub_out,
+          torch.rsub(y, x, alpha=alpha),
+          torch.ops.aten._add_relu.Tensor(-x, y, alpha=alpha),
+          torch.ops.aten._add_relu_.Tensor(-x, y, alpha=alpha),
+          relu_out,
+          torch.ops.aten._add_relu.Scalar(-x, 0.53125, alpha=alpha),
+          torch.ops.aten._add_relu_.Scalar(-x, 0.53125, alpha=alpha),
       )
 
     kernel = (
-      torch.compile(variants, backend="tpu", fullgraph=True, dynamic=False)
-      if use_compiled
-      else variants
+        torch.compile(variants, backend="tpu", fullgraph=True, dynamic=False)
+        if use_compiled
+        else variants
     )
     x = torch.full((33,), 0.052978515625, dtype=dtype)
     y = torch.full((33,), 0.53125, dtype=dtype)
@@ -23919,13 +23921,13 @@ class OpTestingFrameworkTest(op_testing.OpInfoTestBase):
       utils.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
   @parameterized.product(
-    dtypes=[
-      (torch.bfloat16, torch.float32),
-      (torch.bfloat16, torch.float16),
-      (torch.float16, torch.float32),
-      (torch.float16, torch.bfloat16),
-    ],
-    use_compiled=[False, True],
+      dtypes=[
+          (torch.bfloat16, torch.float32),
+          (torch.bfloat16, torch.float16),
+          (torch.float16, torch.float32),
+          (torch.float16, torch.bfloat16),
+      ],
+      use_compiled=[False, True],
   )
   def test_alpha_opmath_out_dtype(self, dtypes, use_compiled):
     dtype, out_dtype = dtypes
@@ -23940,9 +23942,9 @@ class OpTestingFrameworkTest(op_testing.OpInfoTestBase):
       return add_out, sub_out, relu_out
 
     kernel = (
-      torch.compile(variants, backend="tpu", fullgraph=True, dynamic=False)
-      if use_compiled
-      else variants
+        torch.compile(variants, backend="tpu", fullgraph=True, dynamic=False)
+        if use_compiled
+        else variants
     )
     x = torch.full((33,), 0.052978515625, dtype=dtype)
     y = torch.full((33,), 0.53125, dtype=dtype)
@@ -23950,23 +23952,23 @@ class OpTestingFrameworkTest(op_testing.OpInfoTestBase):
     expected_sub = result.to(dtype).to(out_dtype)
     expected_relu = torch.relu(-result).to(dtype).to(out_dtype)
     for actual, expected in zip(
-      kernel(x.to("tpu"), y.to("tpu")),
-      (expected_sub, expected_sub, expected_relu),
+        kernel(x.to("tpu"), y.to("tpu")),
+        (expected_sub, expected_sub, expected_relu),
     ):
       self.assertEqual(actual.dtype, out_dtype)
       utils.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
   @parameterized.product(
-    dtype=[torch.bfloat16, torch.float16],
-    scalar_operand=["self", "other"],
-    scalar_device=["cpu", "tpu"],
-    use_compiled=[False, True],
+      dtype=[torch.bfloat16, torch.float16],
+      scalar_operand=["self", "other"],
+      scalar_device=["cpu", "tpu"],
+      use_compiled=[False, True],
   )
   def test_alpha_opmath_mixed_scalar(
-    self, dtype, scalar_operand, scalar_device, use_compiled
+      self, dtype, scalar_operand, scalar_device, use_compiled
   ):
     wide_value = (
-      1.004150390625 if dtype == torch.bfloat16 else 1.000518798828125
+        1.004150390625 if dtype == torch.bfloat16 else 1.000518798828125
     )
     wide = torch.tensor(wide_value, dtype=torch.float32)
     if scalar_operand == "self":
@@ -23986,13 +23988,13 @@ class OpTestingFrameworkTest(op_testing.OpInfoTestBase):
       return torch.add(x, y, alpha=alpha), out
 
     kernel = (
-      torch.compile(variants, backend="tpu", fullgraph=True, dynamic=False)
-      if use_compiled
-      else variants
+        torch.compile(variants, backend="tpu", fullgraph=True, dynamic=False)
+        if use_compiled
+        else variants
     )
     promoted_dtype = torch.result_type(x, y)
     expected = (
-      x.to(promoted_dtype).float() + alpha * y.to(promoted_dtype).float()
+        x.to(promoted_dtype).float() + alpha * y.to(promoted_dtype).float()
     ).to(promoted_dtype)
     actual, actual_out = kernel(x.to(x_device), y.to(y_device))
     self.assertEqual(actual.dtype, promoted_dtype)
@@ -24006,9 +24008,9 @@ class OpTestingFrameworkTest(op_testing.OpInfoTestBase):
       return torch.add(x, y, alpha=2)
 
     kernel = (
-      torch.compile(add, backend="tpu", fullgraph=True, dynamic=False)
-      if use_compiled
-      else add
+        torch.compile(add, backend="tpu", fullgraph=True, dynamic=False)
+        if use_compiled
+        else add
     )
     x = torch.tensor(16842753, dtype=torch.int32, device=scalar_device)
     y = torch.full((33,), -8388608.0, dtype=torch.bfloat16, device="tpu")
@@ -24048,33 +24050,99 @@ class OpTestingFrameworkTest(op_testing.OpInfoTestBase):
         torch.add(x_tpu, y, alpha=2, out=out)
         utils.assert_close(out.cpu(), expected, rtol=0, atol=0)
 
+  @parameterized.parameters(
+      (torch.float16, torch.float64, 1e5),
+      (torch.uint8, torch.int64, 300),
+      (torch.int32, torch.int64, 2**40),
+      (torch.float32, torch.uint64, 2**63),
+  )
+  def test_alpha_opmath_cpu_scalar_overflow_ir(
+      self, dtype, scalar_dtype, value
+  ):
+    x_cpu = torch.ones((3,), dtype=dtype)
+    scalar_cpu = torch.tensor(value, dtype=scalar_dtype)
+    expected = x_cpu + 2 * scalar_cpu.to(dtype)
+    x_tpu = x_cpu.to("tpu")
+    eager_result = torch.add(x_tpu, scalar_cpu, alpha=2)
+    utils.assert_close(eager_result.cpu(), expected, rtol=0, atol=0)
+    # Keep the scalar on CPU to exercise constant-mode scalar materialization.
+    with execution_mode.set_eager_mode(
+        execution_mode.EagerMode._INTERNAL_COMPILE_FX_GRAPH
+    ):
+      result = torch.add(x_tpu, scalar_cpu, alpha=2)
+    module = tpu_torch_compile.build_mlir([result], [x_tpu])
+    executable = tpu_torch_compile.compile_mlir(module)
+    actual = tpu_torch_compile.execute(executable, [x_tpu])[0]
+    self.assertEqual(actual.dtype, dtype)
+    utils.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
   @parameterized.product(
-    dtype=[torch.uint16, torch.uint32, torch.uint64],
-    use_compiled=[False, True],
+      dtypes=[
+          (torch.float32, torch.bfloat16),
+          (torch.int32, torch.int16),
+      ],
+      use_compiled=[False, True],
+  )
+  def test_alpha_opmath_mixed_tensor(self, dtypes, use_compiled):
+    self_dtype, other_dtype = dtypes
+
+    def variants(x, y):
+      out = torch.empty_like(x)
+      torch.add(x, y, alpha=2, out=out)
+      return (
+          torch.add(x, y, alpha=2),
+          x.clone().add_(y, alpha=2),
+          out,
+          torch.sub(x, y, alpha=2),
+          torch.rsub(y, x, alpha=2),
+      )
+
+    kernel = (
+        torch.compile(variants, backend="tpu", fullgraph=True, dynamic=False)
+        if use_compiled
+        else variants
+    )
+    x = torch.tensor([1, -2, 3], dtype=self_dtype)
+    y = torch.tensor([2, 1, -1], dtype=other_dtype)
+    common_dtype = torch.result_type(x, y)
+    normalized_x = x.to(common_dtype)
+    normalized_y = y.to(common_dtype)
+    expected_add = normalized_x + 2 * normalized_y
+    expected_sub = normalized_x - 2 * normalized_y
+    for actual, expected in zip(
+        kernel(x.to("tpu"), y.to("tpu")),
+        (expected_add, expected_add, expected_add, expected_sub, expected_sub),
+    ):
+      self.assertEqual(actual.dtype, common_dtype)
+      utils.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+  @parameterized.product(
+      dtype=[torch.uint16, torch.uint32, torch.uint64],
+      use_compiled=[False, True],
   )
   def test_alpha_opmath_unsigned(self, dtype, use_compiled):
     def variants(x, y):
       out = torch.empty_like(x)
       torch.add(x, y, alpha=2, out=out)
       return (
-        torch.add(x, y, alpha=2),
-        x.clone().add_(y, alpha=2),
-        out,
-        torch.sub(x, y, alpha=2),
+          torch.add(x, y, alpha=2),
+          x.clone().add_(y, alpha=2),
+          out,
+          torch.sub(x, y, alpha=2),
       )
 
     kernel = (
-      torch.compile(variants, backend="tpu", fullgraph=True, dynamic=False)
-      if use_compiled
-      else variants
+        torch.compile(variants, backend="tpu", fullgraph=True, dynamic=False)
+        if use_compiled
+        else variants
     )
     x = torch.tensor([10, 20, 30], dtype=dtype)
     y = torch.tensor([1, 2, 3], dtype=dtype)
     expected_add = (x.to(torch.int64) + 2 * y.to(torch.int64)).to(dtype)
     expected_sub = (x.to(torch.int64) - 2 * y.to(torch.int64)).to(dtype)
     for actual, expected in zip(
-      kernel(x.to("tpu"), y.to("tpu")),
-      (expected_add, expected_add, expected_add, expected_sub),
+        kernel(x.to("tpu"), y.to("tpu")),
+        (expected_add, expected_add, expected_add, expected_sub),
     ):
       self.assertEqual(actual.dtype, dtype)
       utils.assert_close(actual.cpu(), expected, rtol=0, atol=0)

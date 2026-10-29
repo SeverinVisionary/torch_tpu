@@ -39,6 +39,7 @@
 #include "csrc/common/fixed_size_span.h"
 #include "csrc/common/to_string.h"
 #include "csrc/eager/device_buffer.h"
+#include "csrc/eager/eager_mode.h"
 #include "csrc/eager/op_dispatcher.h"
 #include "csrc/eager/tensor_to_buffer.h"
 #include "csrc/ops/binary.h"
@@ -339,23 +340,44 @@ absl::Status TernaryOpOut(const at::Tensor& self, const at::Tensor& other,
   TT_RETURN_IF_ERROR(ValidateNotLowPrecisionFloat(out));
   TT_ASSIGN_OR_RETURN(const auto promoted_dtype,
                       internal::ToElementType(promoted_scalar_type));
+  TT_ASSIGN_OR_RETURN(const auto computation_dtype,
+                      InferComputationDtype(promoted_dtype));
 
   const bool has_tpu_input =
       IsPrivateUse1Device(self) || IsPrivateUse1Device(other);
   auto normalize_input =
-      [promoted_scalar_type, promoted_dtype,
+      [promoted_scalar_type, promoted_dtype, computation_dtype,
        has_tpu_input](const at::Tensor& tensor) -> absl::StatusOr<at::Tensor> {
     if (has_tpu_input && tensor.device().is_cpu() && tensor.dim() == 0) {
-      // Normalize on the CPU before item() loses wrapped-number metadata. Pass
-      // the common dtype explicitly so lifting also preserves it in cache keys.
-      return MakeTensor(tensor.to(promoted_scalar_type).item(),
-                        promoted_scalar_type);
+      auto scalar = tensor.item();
+      bool needs_host_cast = false;
+      if (scalar.type() == at::ScalarType::UInt64 &&
+          promoted_scalar_type != at::ScalarType::UInt64) {
+        TT_ASSIGN_OR_RETURN(
+            const bool fits_signed,
+            CanCastScalarWithoutOverflow(scalar, at::ScalarType::Long));
+        needs_host_cast = !fits_signed;
+      }
+      if (GetEagerMode() == EagerMode::kInternalCompileFxGraph) {
+        TT_ASSIGN_OR_RETURN(
+            const bool can_cast,
+            CanCastScalarWithoutOverflow(scalar, promoted_scalar_type));
+        needs_host_cast |= !can_cast;
+      }
+      if (needs_host_cast) {
+        // Preserve tensor-cast overflow and normalize large unsigned values
+        // before the helper's signed cache-key and diagnostic conversions.
+        scalar = tensor.to(promoted_scalar_type).item();
+      }
+      return PromoteScalar(std::move(scalar)).GetTensor(promoted_scalar_type);
     }
     if (!IsPrivateUse1Device(tensor) ||
-        tensor.scalar_type() == promoted_scalar_type) {
+        tensor.scalar_type() == promoted_scalar_type ||
+        promoted_dtype == computation_dtype) {
       return tensor;
     }
-    // Lower TPU conversions directly; Tensor.to() would nest an ATen kernel.
+    // Preserve input rounding before widening. When the dtypes match,
+    // DispatchOpOut can cast directly without a separate conversion op.
     return UnaryOp(tensor,
                    [promoted_dtype](mlir::MlirOp input) {
                      return CastIfNeeded(input, promoted_dtype);
@@ -373,8 +395,6 @@ absl::Status TernaryOpOut(const at::Tensor& self, const at::Tensor& other,
   const at::Tensor& other_tpu = tpu_tensors[1];
   const at::Tensor& third_tpu = tpu_tensors[2];
 
-  TT_ASSIGN_OR_RETURN(mlir::ElementType computation_dtype,
-                      InferComputationDtype(promoted_dtype));
   TT_ASSIGN_OR_RETURN(const auto out_element_type,
                       ConvertTo<mlir::ElementType>(out.scalar_type()));
   TT_ASSIGN_OR_RETURN(const auto result_element_type,
